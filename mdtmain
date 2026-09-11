@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""
+mdtmain — interfaccia testuale guidata per mdtcap, in stile raspi-config
+(libreria "dialog"/pythondialog).
+
+Se non c'e' connessione a Internet, propone prima la configurazione di
+rete del Raspberry Pi (Ethernet o WiFi, DHCP o statica) — da li' si puo'
+anche scegliere "Salta" e andare direttamente al menu principale. Il
+menu principale offre sempre tutte e quattro le modalita' di test,
+indipendentemente dalla connessione a Internet (i test che la richiedono
+davvero segnalano l'errore solo se effettivamente provano a contattare
+il server):
+
+  - Test in locale (senza salvare le evidenze).
+  - Test salvando le evidenze su una chiavetta USB.
+  - Test continuo, con invio periodico delle evidenze (cifrate GPG) a un
+    server configurato in main_configs/server.conf.
+  - Download configurazione (autorizzazione al cambio IMEI).
+
+Uso:
+    sudo ./mdtmain
+    sudo ./mdtmain --main   (salta direttamente al menu principale,
+                             senza passare dalla configurazione di rete)
+    sudo ./mdtmain --net-menu   (avvia direttamente sulla configurazione
+                             di rete, anche se Internet e' gia' presente
+                             o se disableNet=1 in main_configs/mdtmain.conf
+                             — unico modo per raggiungerla in quel caso)
+    sudo ./mdtmain --auto-start   (se autoStart=1 e un test continuato e'
+                             configurato — testSim non vuoto — in
+                             main_configs/mdtmain.conf, verifica la SIM
+                             per ICCID e, se corrisponde, salta rete e
+                             menu principale andando dritto al test
+                             continuato, col PIN gia' salvato pre-
+                             riempito; in caso di mancata corrispondenza/
+                             errore disattiva autoStart, mostra un
+                             errore e prosegue con il menu normale)
+    sudo ./mdtmain --screen [--no-banner]
+                            (usa lo schermo HDMI collegato e la
+                             tastiera collegata invece del terminale da
+                             cui e' stato lanciato; abilita i suoni di
+                             avviso via aplay — beep/sirena/evidenza
+                             trovata, vedi src/res/ — al posto del solo
+                             BEL del terminale; mostra per un paio di
+                             secondi l'immagine src/res/mdtcap.png prima
+                             di iniziare, salvo --no-banner)
+    sudo ./mdtmain --run-local --profile NOME [--sim-pin PIN] [--duration MINUTI]
+                            (salta TUTTE le schermate dialog e lancia
+                             subito il test in locale con mdtcap SENZA
+                             --tui, log normale/scorrevole interamente
+                             visibile: utile per il debug, es. isolare
+                             se un problema all'avvio e' in mdtcap o nel
+                             wrapper --tui/dialog di mdtmain)
+    sudo ./mdtmain --run-local --continuous --schedule NOME --profile NOME
+                    [--sim-pin PIN] [--mock-time HH:MM] [--mock-until HH:MM] [--dry-run]
+                            (come sopra, ma per collaudare lo SCHEDULER
+                             del test continuato — vedi main_configs/
+                             profile/<nome>.conf, DSL START/IN/EVERY/
+                             CHECKPOINT — invece di un singolo mdtcap:
+                             nessuna schermata dialog, ogni decisione
+                             stampata in chiaro su stdout. --mock-time
+                             HH:MM fa partire l'orologio dello scheduler
+                             da un orario scelto invece di quello reale
+                             (avanza comunque in tempo reale da li', non
+                             e' congelato): utile per osservare da vicino
+                             una transizione IN/EVERY/PAUSE/CHECKPOINT
+                             senza aspettare la vera ora del giorno.
+                             --mock-until HH:MM ferma il collaudo da solo
+                             quando l'orologio (mockato o reale) lo
+                             raggiunge, in aggiunta a Ctrl+C. --dry-run
+                             non avvia mai mdtcap davvero (ne' invia
+                             nulla in rete): si limita ad attendere/
+                             loggare le decisioni, per collaudare la DSL
+                             senza modem/SIM/rete reali)
+    sudo ./mdtmain --edge-mode
+                            (equivalente a --screen --auto-start, ma
+                             pensato per un uso NON presidiato, es. come
+                             servizio systemd — non ancora installato su
+                             questa macchina, verra' fatto in seguito:
+                             nessuna schermata dialog viene mai
+                             mostrata, ne' e' richiesta nessuna
+                             interazione, quindi il test continuato deve
+                             essere gia' stato configurato ALMENO UNA
+                             VOLTA in modo interattivo, da "Imposta test
+                             continuato" (autoStart/testSim/testPin/
+                             mdtcapProfile/schedulerProfile salvati in
+                             main_configs/mdtmain.conf) — senza,
+                             --edge-mode si ferma subito con un errore
+                             (vedi sotto). Prosegue comunque anche senza
+                             uno schermo HDMI collegato o funzionante
+                             (a differenza di --screen "nudo", non e'
+                             pensato per essere guardato): l'allarme
+                             (sirena.wav) esce sempre dall'uscita audio
+                             jack, indipendentemente dal parametro
+                             "hdmi" di mdtmain.conf (garantisce che si
+                             senta anche senza un altoparlante/una TV
+                             HDMI collegata). Non stampa NULLA (ne' su
+                             stdout/stderr, ne' schermate dialog): ogni
+                             evento significativo (avvio/fine di un
+                             test, un allarme, l'invio di un'evidenza,
+                             un errore/blocco) va invece su syslog
+                             (identificatore "mdtmain", visibile con
+                             "journalctl -t mdtmain" su un sistema
+                             systemd). Usa un file pid
+                             (/run/mdtmain_edge.pid, vedi
+                             src/mdtmain_lib/edgemode.py): se un'altra
+                             istanza di mdtmain (in QUALUNQUE modalita',
+                             non solo --edge-mode) viene avviata mentre
+                             questa e' ancora in esecuzione, questa
+                             viene chiusa (SIGTERM, arresto pulito di
+                             un'eventuale cattura in corso) PRIMA che la
+                             nuova istanza prosegua — cosi' un uso
+                             interattivo non deve mai competere con il
+                             servizio automatico per lo stesso modem)
+
+I flag sopra (tranne --run-local/--edge-mode) sono combinabili fra loro.
+--edge-mode non va combinato con nessun altro flag.
+
+Richiede i permessi di root (come mdtcap/mdtcontract: accesso al modem,
+mount di dispositivi rimovibili, configurazione di rete).
+"""
+import os
+import sys
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "src"))
+
+EXIT_OK = 0
+EXIT_ROOT_REQUIRED = 3
+
+
+def main(argv):
+    if any(a in ("-h", "--help") for a in argv):
+        print(__doc__.strip())
+        return EXIT_OK
+
+    if os.geteuid() != 0:
+        print("mdtmain: richiede i permessi di root (sudo ./mdtmain).", file=sys.stderr)
+        return EXIT_ROOT_REQUIRED
+
+    edge_mode = "--edge-mode" in argv
+
+    if edge_mode:
+        # Abilitato PRIMA di stop_running_instance() sotto, cosi' anche
+        # l'eventuale chiusura di una precedente istanza --edge-mode
+        # (tipico di un riavvio del servizio) finisce su syslog invece
+        # che andare persa: da qui in poi (solo in --edge-mode) ogni
+        # syslog_log.info/warning/error() in tutto mdtmain diventa
+        # effettivo invece che un no-op (vedi src/mdtmain_lib/syslog_log.py).
+        from mdtmain_lib import syslog_log
+        syslog_log.enable()
+
+    # Chiude un'eventuale istanza --edge-mode ancora in esecuzione (file
+    # pid, vedi src/mdtmain_lib/edgemode.py) PRIMA di fare qualunque
+    # altra cosa, qualunque sia la modalita' di QUESTO avvio (anche
+    # un altro --edge-mode: e' cosi' che si "riavvia" il servizio) — un
+    # uso interattivo non deve mai competere col servizio automatico per
+    # lo stesso modem. No-op se nessuna istanza --edge-mode e' in corso.
+    from mdtmain_lib import edgemode
+    edgemode.stop_running_instance()
+
+    screen_mode = "--screen" in argv or edge_mode
+
+    if screen_mode:
+        # Il prima possibile, prima di importare "app" (che a sua volta
+        # importa "ui", che all'import apre gia' un dialog.Dialog): ogni
+        # output dialog/mdtcap successivo deve andare sulla console HDMI
+        # ridiretta qui, non sul terminale da cui mdtmain e' stato
+        # lanciato.
+        from mdtmain_lib import mdtmain_config, screenmode, sound
+        config = mdtmain_config.load()
+        screenmode.activate(hdmi=mdtmain_config.get_bool(config, "hdmi"),
+                             show_banner=(not edge_mode) and "--no-banner" not in argv)
+        sound.enable()
+        if edge_mode:
+            # L'allarme (unico suono mai prodotto in --edge-mode) deve
+            # sempre uscire dal jack, indipendentemente da "hdmi" appena
+            # applicato sopra: in un uso non presidiato non c'e' nessuna
+            # garanzia che ci sia davvero uno schermo/altoparlante HDMI
+            # collegato e attivo (vedi mdtmain --help).
+            screenmode.set_audio_output(hdmi=False)
+            # DOPO screenmode.activate(): quella chiamata fa un fork
+            # interno (il padre esce subito, os._exit) per staccarsi dal
+            # terminale di lancio — il pid da registrare e' quello del
+            # FIGLIO, l'unico che vive per tutta la durata del servizio.
+            edgemode.write_pid_file()
+            edgemode.install_sigterm_handler()
+
+    from mdtmain_lib import app, ui
+
+    if edge_mode:
+        return app.run_edge_mode()
+
+    if "--run-local" in argv:
+        rest = [a for a in argv if a != "--run-local"]
+        bool_flag_by_name = {"--continuous": "continuous", "--dry-run": "dry_run"}
+        value_flag_by_name = {"--profile": "profile", "--sim-pin": "sim_pin",
+                               "--duration": "duration_minutes", "--schedule": "schedule",
+                               "--mock-time": "mock_time", "--mock-until": "mock_until"}
+        raw = {"continuous": False, "dry_run": False}
+        i = 0
+        while i < len(rest):
+            arg = rest[i]
+            if arg in bool_flag_by_name:
+                raw[bool_flag_by_name[arg]] = True
+                i += 1
+                continue
+            name = value_flag_by_name.get(arg)
+            if name is None:
+                print(f"mdtmain --run-local: argomento sconosciuto: {arg}", file=sys.stderr)
+                return 2
+            if i + 1 >= len(rest):
+                print(f"mdtmain --run-local: {arg} richiede un valore.", file=sys.stderr)
+                return 2
+            raw[name] = rest[i + 1]
+            i += 2
+        try:
+            if raw["continuous"]:
+                return app.run_continuous_headless(
+                    schedule=raw.get("schedule"), profile=raw.get("profile"),
+                    sim_pin=raw.get("sim_pin"), mock_time=raw.get("mock_time"),
+                    mock_until=raw.get("mock_until"), dry_run=raw["dry_run"])
+            return app.run_local_test_headless(
+                profile=raw.get("profile"), sim_pin=raw.get("sim_pin"),
+                duration_minutes=raw.get("duration_minutes"))
+        except KeyboardInterrupt:
+            return EXIT_OK
+
+    skip_network_setup = "--main" in argv
+    force_network_setup = "--net-menu" in argv
+    auto_start = "--auto-start" in argv
+
+    if not screen_mode:
+        # Solo sessione terminale/SSH vera (la console fisica di
+        # --screen non ha "una finestra" da ridimensionare/titolare).
+        ui.request_larger_window()
+        ui.set_window_title("MDTCap")
+    try:
+        app.run_app(skip_network_setup=skip_network_setup,
+                     force_network_setup=force_network_setup,
+                     auto_start=auto_start)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if not screen_mode:
+            ui.restore_window_title()
+        # "dialog" disegna sullo schermo normale (non l'alternate screen
+        # buffer): senza questo, l'ultima schermata (menu principale,
+        # "Uscire da MDTCap?", ...) resta come residuo dopo l'uscita.
+        ui.clear_screen()
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

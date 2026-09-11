@@ -1,0 +1,378 @@
+#!/usr/bin/env bash
+#
+# mdtgps
+#
+# Attiva il GPS/GNSS del modulo Qualcomm-based (es. SIM7600E-H) usato da
+# mdtcap/mdtdiag, attende un fix valido e lo scrive (stdout ed
+# opzionalmente su file), con le coordinate anche convertite in gradi
+# decimali oltre al dato grezzo AT+CGPSINFO.
+#
+# Script indipendente: non modifica ne' richiama mdtcap/mdtdiag. Duplica
+# volutamente la piccola quantita' di logica di autodetect/AT condivisa
+# (stesso algoritmo di ricerca porta, stesso stile di log) per restare
+# un singolo file autonomo, senza dipendenze dagli altri due script.
+#
+# Licenza: GNU General Public License v3.0 (GPLv3) — vedi LICENSE.
+# Autore:  EPTO Tramaci
+#
+# Uso:
+#   sudo ./mdtgps --list-ports
+#   sudo ./mdtgps --at-port /dev/ttyUSB2 [--baud 115200] [--wait SECONDS]
+#       [--poll-interval SECONDS] [--out FILE] [--gps-off] [--no-banner]
+#   sudo ./mdtgps --autodetect [--autodetect-vendor STRINGA]
+#       [--autodetect-model STRINGA] [--wait SECONDS] [...]
+#
+# --autodetect: individua da sola la porta AT tra i device /dev/ttyUSB*
+#   presenti (stesso algoritmo di mdtcap/mdtdiag --autodetect: prova "AT"
+#   su ogni candidata filtrata per vendor/modello, default vendor
+#   "SimTech", usa la prima che risponde OK).
+#
+# --wait SECONDS (default 120): tempo massimo di attesa per un fix
+#   valido (AT+CGPSINFO con latitudine non vuota), riprovando ogni
+#   --poll-interval secondi. Se il modulo ha gia' un fix "caldo" puo'
+#   arrivare in pochi secondi; a freddo (GPS spento da tempo, prima
+#   ricezione dei dati di almanacco/efemeridi) puo' richiedere diversi
+#   minuti in condizioni di vista del cielo non ottimali. Se allo scadere
+#   non c'e' ancora un fix, lo script esce con codice 2 (nessun fix
+#   ottenuto), lasciando comunque il GPS acceso (vedi --gps-off).
+#
+# --poll-interval SECONDS (default 5): intervallo tra un tentativo e
+#   l'altro durante l'attesa.
+#
+# --out FILE: oltre a stdout, salva anche lo stesso blocco testuale in
+#   FILE (sovrascritto).
+#
+# --gps-off: spegne il GPS (AT+CGPS=0) subito dopo aver scritto il fix
+#   (o dopo il timeout, se richiesto/atteso senza successo). Per default
+#   il GPS resta ACCESO: un fix successivo (es. lanciando di nuovo questo
+#   script, o una cattura mdtcap con --gps-wait) e' quasi sempre piu'
+#   rapido a modulo gia' "caldo" — stesso comportamento non invasivo di
+#   mdtdiag --gps-activate.
+#
+# --baud RATE: baud rate "best effort" per la porta AT (default 115200,
+#   vedi nota in mdtcap: su queste porte seriali USB e' solo informativo).
+#
+# --no-banner: disabilita l'intestazione iniziale ("mdtgps ver ...").
+#
+# mdt_configs/system.conf: se presente (relativo alla posizione di questo
+#   script), viene caricato automaticamente ad ogni esecuzione — stesso
+#   file di sistema usato da mdtcap (porta o --autodetect, --qcsuper),
+#   generato/aggiornato da "sudo ./install.sh --configure-system". Solo
+#   --at-port/--autodetect/--autodetect-vendor/--autodetect-model/--baud
+#   hanno un effetto qui (mdtgps non fa cattura, non serve la porta
+#   Diag): --diag-port/--qcsuper, se presenti nel file, vengono accettati
+#   ma ignorati, cosi' lo stesso system.conf resta riusabile cosi' com'e'
+#   fra mdtcap/mdtdiag/mdtgps. Qualunque valore passato esplicitamente
+#   sulla riga di comando vince sempre su questo file.
+#
+# Conversione in gradi decimali: AT+CGPSINFO (specifica AT SIMCom)
+# restituisce latitudine/longitudine nel formato NMEA "ddmm.mmmmmm"
+# (2 cifre di gradi + minuti decimali) per la latitudine e
+# "dddmm.mmmmmm" (3 cifre di gradi) per la longitudine, entrambe SENZA
+# segno (il segno e' dato dai campi separati N/S, E/W). Qui vengono
+# convertite in gradi decimali con segno (N/E positivi, S/W negativi):
+# gradi_decimali = gradi_interi + minuti/60. Il dato grezzo originale
+# resta comunque riportato in output, per riferimento/verifica.
+
+set -euo pipefail
+
+SCRIPT_VERSION="1.0"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+
+AT_PORT=""
+BAUD=115200
+AUTODETECT=0
+AUTODETECT_VENDOR="SimTech"
+AUTODETECT_MODEL=""
+WAIT_TIMEOUT=120
+POLL_INTERVAL=5
+OUT_FILE=""
+GPS_OFF=0
+BANNER_ENABLED=1
+
+usage() {
+    # Range dinamico (non un numero di riga fisso): si ferma da solo
+    # prima di "set -euo pipefail", non va aggiornato manualmente ogni
+    # volta che questo blocco di commenti cambia lunghezza.
+    sed -n '3,/^set -euo pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
+    exit 1
+}
+
+log() {
+    local msg="[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"
+    echo "$msg" >&2
+}
+
+# ---- porte: stesso approccio di mdtcap/mdtdiag (dmesg + udevadm) ------
+
+list_ports() {
+    echo "=== dmesg (ultime righe con ttyUSB) ==="
+    dmesg | grep -i ttyUSB || echo "(nessuna riga trovata, prova 'sudo dmesg' o ricollega il modulo)"
+    echo
+    echo "=== porte seriali presenti ==="
+    for p in /dev/ttyUSB*; do
+        [[ -e "$p" ]] || continue
+        info=$(udevadm info -q property -n "$p" 2>/dev/null | grep -E '^(ID_USB_INTERFACE_NUM|ID_MODEL|ID_VENDOR)=' | tr '\n' ' ')
+        echo "$p  $info"
+    done
+    echo
+    echo "Individua una porta AT inviando 'AT' (deve rispondere OK), oppure usa --autodetect."
+}
+
+# Prova "AT" su un candidato, senza toccare lo stato globale (identico
+# nello spirito a probe_at_candidate() di mdtcap/mdtdiag).
+probe_at_candidate() {
+    local dev="$1" fd resp="" line start_ts
+    stty -F "$dev" 115200 2>/dev/null || true
+    stty -F "$dev" raw -echo -echoe -echok time 0 min 0 2>/dev/null || return 1
+    exec {fd}<>"$dev" 2>/dev/null || return 1
+    printf 'AT\r' >&"$fd" 2>/dev/null
+    start_ts=$SECONDS
+    while IFS= read -r -t 2 -u "$fd" line 2>/dev/null; do
+        line="${line//$'\r'/}"
+        [[ -z "$line" ]] && continue
+        resp+="$line"$'\n'
+        [[ "$line" == "OK" || "$line" == "ERROR" ]] && break
+        (( SECONDS - start_ts >= 3 )) && break
+    done
+    exec {fd}<&-
+    printf '%s' "$resp"
+}
+
+autodetect_at_port() {
+    local candidates=() p info resp
+
+    for p in /dev/ttyUSB*; do
+        [[ -e "$p" ]] || continue
+        info=$(udevadm info -q property -n "$p" 2>/dev/null) || info=""
+        if [[ -n "$AUTODETECT_VENDOR" ]]; then
+            echo "$info" | grep -qi "^ID_VENDOR=.*$AUTODETECT_VENDOR" || continue
+        fi
+        if [[ -n "$AUTODETECT_MODEL" ]]; then
+            echo "$info" | grep -qi "^ID_MODEL=.*$AUTODETECT_MODEL" || continue
+        fi
+        candidates+=("$p")
+    done
+
+    if [[ ${#candidates[@]} -eq 0 ]]; then
+        log "ATTENZIONE: --autodetect non ha trovato nessuna porta ttyUSB corrispondente (vendor='${AUTODETECT_VENDOR:-qualsiasi}', modello='${AUTODETECT_MODEL:-qualsiasi}')."
+        return 1
+    fi
+    log "Autodetect: ${#candidates[@]} porta/e candidate: ${candidates[*]}"
+
+    for p in "${candidates[@]}"; do
+        resp=$(probe_at_candidate "$p") || resp=""
+        if echo "$resp" | grep -q '^OK$'; then
+            AT_PORT="$p"
+            log "Autodetect: porta AT trovata su $p"
+            return 0
+        fi
+    done
+    log "ATTENZIONE: --autodetect non ha trovato nessuna porta AT (nessuna candidata risponde OK ad 'AT')."
+    return 1
+}
+
+# ---- pre-scan di mdt_configs/system.conf: espande in argomenti --------
+#
+# Stesso file di sistema (porta o --autodetect, --qcsuper) usato da
+# mdtcap: caricato automaticamente se presente (silenziosamente ignorato
+# se assente), con la precedenza piu' bassa possibile - qualunque
+# argomento reale sulla riga di comando vince sempre su questo file. Solo
+# --at-port/--autodetect/--autodetect-vendor/--autodetect-model/--baud
+# hanno un effetto qui (mdtgps non fa capture, non serve mai la porta
+# Diag): --diag-port/--qcsuper, se presenti nel file (di norma lo sono,
+# essendo lo stesso system.conf di mdtcap), vengono accettati ma ignorati
+# (vedi sotto), cosi' lo stesso file resta riusabile senza modifiche fra
+# i vari script del progetto.
+SYSTEM_FILE="$SCRIPT_DIR/mdt_configs/system.conf"
+if [[ -f "$SYSTEM_FILE" ]]; then
+    readarray -t SYSTEM_ARGS < <(
+        grep -v '^[[:space:]]*#' "$SYSTEM_FILE" | grep -v '^[[:space:]]*$' | xargs -n1 printf '%s\n'
+    )
+    set -- "${SYSTEM_ARGS[@]}" "$@"
+fi
+
+# ---- parsing argomenti --------------------------------------------------
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --list-ports) list_ports; exit 0 ;;
+        --at-port) AT_PORT="$2"; shift 2 ;;
+        --baud) BAUD="$2"; shift 2 ;;
+        --autodetect) AUTODETECT=1; shift ;;
+        --autodetect-vendor) AUTODETECT_VENDOR="$2"; shift 2 ;;
+        --autodetect-model) AUTODETECT_MODEL="$2"; shift 2 ;;
+        --wait) WAIT_TIMEOUT="$2"; shift 2 ;;
+        --poll-interval) POLL_INTERVAL="$2"; shift 2 ;;
+        --out) OUT_FILE="$2"; shift 2 ;;
+        --gps-off) GPS_OFF=1; shift ;;
+        --no-banner) BANNER_ENABLED=0; shift ;;
+        --diag-port|--qcsuper|--usb-modem-vid|--usb-modem-pid) shift 2 ;;  # da system.conf, non usati qui (nessuna cattura)
+        -h|--help) usage ;;
+        *) echo "Argomento sconosciuto: $1" >&2; usage ;;
+    esac
+done
+
+[[ $EUID -eq 0 ]] || { echo "Esegui come root (serve accesso raw alla porta seriale AT)." >&2; exit 1; }
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || { echo "Comando richiesto non trovato: $1" >&2; exit 1; }
+}
+require_cmd stty
+require_cmd date
+require_cmd awk
+
+if [[ "$BANNER_ENABLED" -eq 1 ]]; then
+    echo "mdtgps ver $SCRIPT_VERSION"
+    echo "(C) 2026 EPTO Tramaci"
+    echo
+fi
+
+if [[ "$AUTODETECT" -eq 1 && -z "$AT_PORT" ]]; then
+    autodetect_at_port || true
+fi
+
+[[ -n "$AT_PORT" ]] || { echo "Manca --at-port (usa --list-ports o --autodetect per individuarla)." >&2; exit 1; }
+[[ -e "$AT_PORT" ]] || { echo "Porta AT inesistente: $AT_PORT" >&2; exit 1; }
+
+# ---- apertura porta AT persistente (stesso approccio di mdtcap/mdtdiag) -
+
+stty -F "$AT_PORT" "$BAUD" 2>/dev/null || true
+stty -F "$AT_PORT" raw -echo -echoe -echok time 0 min 0
+exec {AT_FD}<>"$AT_PORT"
+
+at_query() {
+    local cmd="$1" tmo="${2:-3}" resp="" line
+    printf '%s\r' "$cmd" >&"$AT_FD"
+    while IFS= read -r -t "$tmo" -u "$AT_FD" line; do
+        line="${line//$'\r'/}"
+        [[ -z "$line" ]] && continue
+        [[ "$line" == "$cmd" ]] && continue
+        resp+="$line"$'\n'
+        if [[ "$line" == "OK" || "$line" == "ERROR" || "$line" =~ ^\+CME\ ERROR ]]; then
+            break
+        fi
+    done
+    printf '%s' "$resp"
+}
+
+extract_field() {
+    local text="$1" prefix="$2" line
+    while IFS= read -r line; do
+        line="${line//$'\r'/}"
+        [[ -z "$line" || "$line" == "OK" || "$line" == "ERROR" ]] && continue
+        if [[ -z "$prefix" ]]; then
+            printf '%s' "$line"
+            return 0
+        fi
+        if [[ "$line" == "$prefix"* ]]; then
+            line="${line#"$prefix"}"
+            while [[ "$line" == " "* ]]; do line="${line# }"; done
+            printf '%s' "$line"
+            return 0
+        fi
+    done <<< "$text"
+    printf ''
+}
+
+# Converte un valore NMEA "[d]dmm.mmmmmm" (senza segno) in gradi decimali
+# (senza segno): gradi_interi = parte intera diviso 100, minuti = resto.
+# Il segno (N/S, E/W) viene applicato dal chiamante.
+nmea_to_decimal() {
+    local raw="$1"
+    awk -v raw="$raw" 'BEGIN {
+        deg = int(raw / 100)
+        min = raw - (deg * 100)
+        printf "%.6f", deg + (min / 60)
+    }'
+}
+
+# ---- attivazione GPS + attesa fix --------------------------------------
+
+gps_state_raw=$(extract_field "$(at_query 'AT+CGPS?' 5)" '+CGPS:')
+gps_state="${gps_state_raw%%,*}"
+if [[ "$gps_state" == "1" ]]; then
+    log "GPS/GNSS gia' attivo (AT+CGPS?: $gps_state_raw)"
+else
+    log "GPS/GNSS spento, attivazione: AT+CGPS=1"
+    at_query 'AT+CGPS=1' 5 >/dev/null
+fi
+
+log "Attesa fix GPS/GNSS (fino a ${WAIT_TIMEOUT}s, controllo ogni ${POLL_INTERVAL}s)..."
+
+elapsed=0
+gps_info=""
+while true; do
+    gps_info=$(extract_field "$(at_query 'AT+CGPSINFO' 5)" '+CGPSINFO:')
+    lat_raw=$(echo "$gps_info" | cut -d',' -f1)
+    if [[ -n "$lat_raw" ]]; then
+        log "Fix GPS/GNSS ottenuto dopo ${elapsed}s: $gps_info"
+        break
+    fi
+    if (( elapsed >= WAIT_TIMEOUT )); then
+        log "ATTENZIONE: nessun fix GPS/GNSS ottenuto entro ${WAIT_TIMEOUT}s."
+        [[ "$GPS_OFF" -eq 1 ]] && { log "Spegnimento GPS (--gps-off): AT+CGPS=0"; at_query 'AT+CGPS=0' 5 >/dev/null || true; }
+        exec {AT_FD}<&- || true
+        exit 2
+    fi
+    log "GPS/GNSS: nessun fix ancora (${elapsed}s/${WAIT_TIMEOUT}s)"
+    sleep "$POLL_INTERVAL"
+    elapsed=$((elapsed + POLL_INTERVAL))
+done
+
+# ---- parsing campi AT+CGPSINFO e conversione in gradi decimali --------
+#
+# Formato (specifica AT SIMCom):
+#   <lat>,<N/S>,<log>,<E/W>,<date>,<UTC time>,<alt>,<speed>,<course>
+# dove <alt> e' l'altitudine MSL in metri, <speed> la velocita' sul
+# terreno in Km/h, <course> la direzione in gradi rispetto al Nord.
+
+lat_raw=$(echo "$gps_info" | cut -d',' -f1)
+ns=$(echo "$gps_info" | cut -d',' -f2)
+lon_raw=$(echo "$gps_info" | cut -d',' -f3)
+ew=$(echo "$gps_info" | cut -d',' -f4)
+date_raw=$(echo "$gps_info" | cut -d',' -f5)
+time_raw=$(echo "$gps_info" | cut -d',' -f6)
+alt_m=$(echo "$gps_info" | cut -d',' -f7)
+speed_kmh=$(echo "$gps_info" | cut -d',' -f8)
+course_deg=$(echo "$gps_info" | cut -d',' -f9)
+
+lat_dd=$(nmea_to_decimal "$lat_raw")
+[[ "$ns" == "S" ]] && lat_dd="-$lat_dd"
+lon_dd=$(nmea_to_decimal "$lon_raw")
+[[ "$ew" == "W" ]] && lon_dd="-$lon_dd"
+
+# date_raw = ddmmyy, time_raw = hhmmss.ss -> ISO8601 UTC
+iso_ts=""
+if [[ "$date_raw" =~ ^([0-9]{2})([0-9]{2})([0-9]{2})$ ]]; then
+    dd="${BASH_REMATCH[1]}"; mm="${BASH_REMATCH[2]}"; yy="${BASH_REMATCH[3]}"
+    hh="${time_raw:0:2}"; mi="${time_raw:2:2}"; ss="${time_raw:4}"
+    iso_ts="20${yy}-${mm}-${dd}T${hh}:${mi}:${ss%.*}Z"
+fi
+
+output=$(cat <<EOF
+=== Posizione GPS/GNSS ===
+Timestamp UTC (fix)   : ${iso_ts:-non determinabile}
+Latitudine            : ${lat_dd}°
+Longitudine           : ${lon_dd}°
+Altitudine (MSL)      : ${alt_m:-?} m
+Velocita' sul terreno : ${speed_kmh:-?} Km/h
+Direzione             : ${course_deg:-?}° dal Nord
+Dato grezzo AT+CGPSINFO: $gps_info
+Google Maps           : https://maps.google.com/?q=${lat_dd},${lon_dd}
+EOF
+)
+
+echo
+echo "$output"
+[[ -n "$OUT_FILE" ]] && printf '%s\n' "$output" > "$OUT_FILE" && log "Posizione salvata in $OUT_FILE"
+
+if [[ "$GPS_OFF" -eq 1 ]]; then
+    log "Spegnimento GPS (--gps-off): AT+CGPS=0"
+    at_query 'AT+CGPS=0' 5 >/dev/null || true
+else
+    log "GPS lasciato acceso (usa --gps-off per spegnerlo)."
+fi
+
+exec {AT_FD}<&- || true
+exit 0

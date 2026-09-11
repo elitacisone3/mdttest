@@ -1,0 +1,1156 @@
+#!/usr/bin/env python3
+"""
+Scansione euristica "extra" (mdtcap --extended) per una prima
+discriminazione di comportamenti di rete sospetti/malevoli tipici degli
+IMSI-catcher, ispirata a SnoopSnitch (SRLabs), Darshak, AIMSICD: NON un
+verdetto definitivo, un indizio da verificare — vedi "Tutto questo ci
+serve per una discriminazione iniziale" nel commento --extended di
+mdtcap. Pensato per essere esteso/corretto nel tempo (vedi
+extra_configs/README.md).
+
+Categorie (chiave -> testo, STESSO ordine ovunque: --get-defs, log,
+report, manifest.json/--shm di mdtcap):
+    SMSSTK   SMS/STK
+    NASId    NAS/Identità
+    RRCCiph  RRC/Cifratura
+    cellSys  Cella/Sistema
+    GPSLoc   GPS/Localizzazione
+    WCDMA3G  3G/UMTS
+(le prime 4 sono quelle richieste esplicitamente; GPSLoc/WCDMA3G sono
+un'estensione decisa in fase di progettazione — vedi il piano di
+implementazione — per coprire rispettivamente l'incoerenza cella/GPS e
+il downgrade/A5-0 su 3G, entrambi citati come euristiche SnoopSnitch-
+style ma non riconducibili pulitamente a nessuna delle 4 categorie
+originali.)
+
+Uso
+---
+    extra_scan --get-defs
+        Stampa le 6 righe "CHIAVE testo" sopra e termina. Nessun altro
+        parametro letto: deve poter girare PRIMA che esista una cattura
+        (mdtcap la invoca sempre, per popolare le etichette della
+        sezione "Controlli extra:" di TUI/report, anche se --extended
+        non e' stato richiesto per QUESTA esecuzione).
+
+    extra_scan (--op NOME | --mcc MCC --mnc MNC) [--profile NOME]
+        --file capture.dlf --out DIR
+        Esegue la scansione vera e propria. --op/--mcc+--mnc e --profile
+        risolvono le regole da leggere in extra_configs/ (vedi
+        extra_configs/README.md per il formato/l'ordine di lettura
+        main.conf -> op -> profile); --file e' il file .dlf della
+        cattura; --out e' la directory di output (stessa del report di
+        mdtcap: qui vengono scritti extra_scan_report.txt,
+        extra_scan.log e un log per categoria).
+
+Uscita (stdout): SOLO le righe "chiave=valore" seguenti, in quest'ordine
+(stesso contratto di src/mdt_bitscan.py: nessun altro rumore su stdout,
+tutto il resto va nel report/nei log):
+    SMSSTK_L=W
+    SMSSTK_N=1
+    NASId_L=C
+    NASId_N=3
+    RRCCiph_L=A
+    RRCCiph_N=1
+    cellSys_L=I
+    cellSys_N=0
+    GPSLoc_L=I
+    GPSLoc_N=0
+    WCDMA3G_L=I
+    WCDMA3G_N=0
+    extraLevel=A
+"_L" e' il livello (I/W/C/A) piu' alto fra le regole attivate di quella
+categoria, "_N" il numero totale di occorrenze grezze rilevate in quella
+categoria; "extraLevel" e' il piu' alto fra tutte le categorie.
+
+Livelli
+-------
+    I  Ignore     (verde in TUI)
+    W  Warning    (arancione)
+    C  Cumulativo (rosso scuro) — se le occorrenze a livello C di una
+                  regola superano la sua soglia "cum_threshold"
+                  (extra_configs/), la regola viene PROMOSSA ad "A"
+                  nell'aggregato finale (le singole righe di log
+                  restano "C", solo il livello aggregato sale).
+    A  Assoluto   (rosso) — segnala qualcosa di gia' di per se' malevolo.
+
+Log
+---
+extra_scan.log (generale) + un extra_scan_<CATEGORIA>.log per ciascuna
+delle 6 categorie, sempre creati (anche vuoti/senza eventi), in
+$OUT. Una riga per evento:
+    [2026-09-08T14:32:10Z] A NASID_UNSOLICITED_ Log Identity Request IMSI...
+seguita, se sono disponibili i byte grezzi del frame che ha fatto
+scattare la regola, da una seconda riga con lo STESSO codice e l'hex
+dump (cosi' "grep CODICE file.log" trova entrambe le righe insieme):
+                        NASID_UNSOLICITED_ 4500003d0000...
+Codice = "<CATEGORIA>_<evento>" maiuscolo, troncato/paddato con "_" a 16
+caratteri (le chiavi attuali — es. SMSSTK_SILENT_SMS — restano leggibili
+per intero o quasi entro questa lunghezza; 24 sarebbe stato inutilmente
+piu' largo per i nomi oggi in uso, ma il motore non dipende da questo
+numero specifico: vedi CODE_LEN sotto).
+
+Rilevatori implementati in questa versione (v1) e limiti noti
+---------------------------------------------------------------
+RRCCiph.eea0_eia0, NASId.unsolicited_identity_imsi,
+NASId.guti_realloc_anomaly, cellSys.forced_2g_downgrade,
+WCDMA3G.forced_3g_downgrade, WCDMA3G.a5_0_2g: via dissezione tshark del
+pcap (stessa pipeline qcsuper -> pcap -> tshark gia' usata dal resto di
+mdtcap), sui dissector lte-rrc/nas-eps/gsm_a.rr gia' integrati.
+SMSSTK.silent_sms: scansione byte-a-byte del .dlf grezzo (i messaggi EMM
+"NAS transport" che veicolano SMS su LTE non sono scomposti fino al TPDU
+dal dissector nas-eps di Wireshark) alla ricerca di una struttura
+SMS-DELIVER (TS 23.038/23.040) plausibile, con verifica del TP-DCS per
+la classe 0/2 — stesso spirito "candidato da verificare" di
+src/mdt_bitscan.py, non una certezza.
+SMSSTK.simjacker_envelope, NASId.attach_identity_release,
+cellSys.no_neighbor_list: NON ancora implementati (richiedono
+rispettivamente un decoder degli envelope STK/OTA, la correlazione di
+una sequenza di messaggi in una finestra breve, e l'analisi dei SIB
+della cella servente) — le regole restano configurabili in
+extra_configs/ ma restituiscono sempre 0 occorrenze in questa versione.
+GPSLoc.cell_gps_incoherent: confronto fra cella (cell_id/pci) e distanza
+GPS fra campioni consecutivi di periodic_cell_gps_decoded.csv (prodotto
+da mdtcap nella stessa $OUT), nessuna dipendenza da tshark.
+"""
+import argparse
+import configparser
+import csv
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+from collections import defaultdict, namedtuple
+from datetime import datetime, timezone
+from struct import unpack_from
+
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
+DEFAULT_CONFIGS_DIR = os.path.join(PROJECT_DIR, "extra_configs")
+
+# Ordine fisso, usato ovunque (--get-defs, log, report, ordine delle
+# righe "_L"/"_N" su stdout): NON un dict qualunque, un elenco di coppie
+# per non dipendere dall'ordine di inserzione di un dict letto altrove.
+CATEGORIES = [
+    ("SMSSTK", "SMS/STK"),
+    ("NASId", "NAS/Identità"),
+    ("RRCCiph", "RRC/Cifratura"),
+    ("cellSys", "Cella/Sistema"),
+    ("GPSLoc", "GPS/Localizzazione"),
+    ("WCDMA3G", "3G/UMTS"),
+]
+CATEGORY_KEYS = [k for k, _ in CATEGORIES]
+
+CODE_LEN = 16
+LEVELS = ("I", "W", "C", "A")
+LEVEL_RANK = {"I": 0, "W": 1, "C": 2, "A": 3}
+
+LOG_LTE_NAS_EMM_OTA_IN_MSG_LOG_C = 0xB0EC
+LOG_LTE_NAS_EMM_OTA_OUT_MSG_LOG_C = 0xB0ED
+
+# --test-sms: SMS "magica" inviata da un altro telefono in un ambiente di
+# test controllato per innescare manualmente una categoria (vedi
+# detect_test_sms_trigger sotto). Testo esatto atteso (spazi bianchi
+# ignorati), con CATEGORIA sostituita da uno dei 6 token a 7 caratteri:
+#   ${"37337:H4XOR:MEGAVIRUS:T35T:F4K3:P4YL04D"::do(CATEGORIA)}
+# evt name riservato per queste regole sintetiche: "test_sms_forced", MAI
+# usato da nessun'altra regola (vedi extra_configs/main.conf).
+TEST_SMS_EVT = "test_sms_forced"
+TEST_SMS_CATEGORY_TOKENS = {
+    "RRCCiph": "RRCCiph",
+    "cellSys": "cellSys",
+    "WCDMA3G": "WCDMA3G",
+    "NASId__": "NASId",
+    "SMSSTK_": "SMSSTK",
+}
+TEST_SMS_ALL_TOKEN = "ALL____"
+TEST_SMS_TEXT_RE = re.compile(
+    r'^\$\{"37337:H4XOR:MEGAVIRUS:T35T:F4K3:P4YL04D"::do\(([A-Za-z0-9_]{7})\)\}$'
+)
+
+Occurrence = namedtuple("Occurrence", "cat evt ts level detail raw")
+
+
+def make_code(cat, evt):
+    raw = f"{cat}_{evt}".upper()
+    return raw[:CODE_LEN].ljust(CODE_LEN, "_")
+
+
+def iso(ts):
+    if isinstance(ts, datetime):
+        return ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if isinstance(ts, (int, float)):
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return str(ts)
+
+
+# ---------------------------------------------------------------------
+# --get-defs
+# ---------------------------------------------------------------------
+
+def cmd_get_defs():
+    for key, label in CATEGORIES:
+        print(f"{key} {label}")
+    return 0
+
+
+# ---------------------------------------------------------------------
+# extra_configs/: caricamento regole (main.conf -> op -> profile)
+# ---------------------------------------------------------------------
+
+def resolve_op_file(configs_dir, op, mcc, mnc):
+    if op:
+        f = os.path.join(configs_dir, "op", f"{op}.conf")
+        return f if os.path.isfile(f) else None
+    if mcc and mnc:
+        link = os.path.join(configs_dir, "mcc-mnc", f"{mcc}-{mnc}")
+        if os.path.isfile(link):
+            return link
+    return None
+
+
+def load_config(configs_dir, op, profile, mcc, mnc):
+    # interpolation=None: alcuni "log_msg" contengono placeholder stile
+    # "%(nome)s" pensati per essere popolati dai singoli detector, non da
+    # configparser stesso (che altrimenti li tratterebbe come riferimenti
+    # incrociati fra chiavi INI e fallirebbe se "nome" non esiste).
+    cp = configparser.ConfigParser(interpolation=None)
+    main_conf = os.path.join(configs_dir, "main.conf")
+    loaded = []
+    if os.path.isfile(main_conf):
+        cp.read(main_conf)
+        loaded.append(main_conf)
+    op_file = resolve_op_file(configs_dir, op, mcc, mnc)
+    if op_file:
+        cp.read(op_file)
+        loaded.append(op_file)
+    if profile:
+        profile_file = os.path.join(configs_dir, "profile", f"{profile}.conf")
+        if os.path.isfile(profile_file):
+            cp.read(profile_file)
+            loaded.append(profile_file)
+    return cp, loaded
+
+
+def build_rules(cp):
+    rules = {}
+    for section in cp.sections():
+        if "." not in section:
+            continue
+        cat, evt = section.split(".", 1)
+        if not cp.getboolean(section, "enabled", fallback=True):
+            continue
+        level = cp.get(section, "level", fallback="I").strip().upper()
+        if level not in LEVELS:
+            level = "I"
+        rules[(cat, evt)] = {
+            "level": level,
+            "min": cp.getint(section, "min", fallback=1),
+            "max": cp.getint(section, "max", fallback=0),
+            "window_s": cp.getint(section, "window_s", fallback=0),
+            "cum_threshold": cp.getint(section, "cum_threshold", fallback=0),
+            "min_interval_s": cp.getint(section, "min_interval_s", fallback=0),
+            "max_interval_s": cp.getint(section, "max_interval_s", fallback=0),
+            "mode": cp.get(section, "mode", fallback=""),
+            "comment": cp.get(section, "comment", fallback=""),
+            "log_msg": cp.get(section, "log_msg", fallback=""),
+        }
+    return rules
+
+
+# ---------------------------------------------------------------------
+# pcap: riuso se gia' presente accanto al .dlf, altrimenti rigenerazione
+# (stessi flag di mdtcap: --reassemble-sibs --decrypt-nas)
+# ---------------------------------------------------------------------
+
+def ensure_pcap(dlf_path, out_dir):
+    if not dlf_path or not os.path.isfile(dlf_path):
+        return None, "file .dlf non trovato o non indicato (--file)"
+    base = os.path.splitext(os.path.basename(dlf_path))[0]
+    for candidate_dir in (os.path.dirname(dlf_path) or ".", out_dir or "."):
+        candidate = os.path.join(candidate_dir, base + ".pcap")
+        if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+            return candidate, None
+
+    qcsuper_bin = shutil.which("qcsuper") or shutil.which("qcsuper.py")
+    if not qcsuper_bin:
+        return None, "nessun .pcap trovato accanto al .dlf e qcsuper non disponibile per rigenerarlo"
+
+    gen_path = os.path.join(out_dir or ".", "._extra_scan_regen.pcap")
+    cmd = ([sys.executable, qcsuper_bin] if qcsuper_bin.endswith(".py") else [qcsuper_bin])
+    cmd += ["--dlf-read", dlf_path, "--pcap-dump", gen_path, "--reassemble-sibs", "--decrypt-nas"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"rigenerazione pcap dal .dlf fallita: {exc}"
+    if r.returncode != 0 or not os.path.isfile(gen_path):
+        return None, f"rigenerazione pcap dal .dlf fallita (qcsuper exit {r.returncode})"
+    return gen_path, None
+
+
+# ---------------------------------------------------------------------
+# tshark: estrazione campi + hex dump per singolo frame
+# ---------------------------------------------------------------------
+
+def run_tshark_fields(pcap, disp_filter, fields):
+    if not pcap or not os.path.isfile(pcap):
+        return []
+    cmd = ["tshark", "-r", pcap, "-T", "fields", "-E", "separator=\t", "-E", "occurrence=f"]
+    if disp_filter:
+        cmd += ["-Y", disp_filter]
+    for f in fields:
+        cmd += ["-e", f]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if out.returncode != 0:
+        return []
+    rows = []
+    for line in out.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        parts += [""] * (len(fields) - len(parts))
+        rows.append(dict(zip(fields, parts)))
+    return rows
+
+
+_HEXLINE_RE = re.compile(r'^[0-9a-fA-F]{4,8}\s+((?:[0-9a-fA-F]{2}\s+){1,16})')
+
+
+def hexdump_for_frame(pcap, frame_number):
+    if not pcap or not frame_number:
+        return ""
+    cmd = ["tshark", "-r", pcap, "-Y", f"frame.number=={frame_number}", "-x"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if out.returncode != 0:
+        return ""
+    hexbytes = []
+    for line in out.stdout.splitlines():
+        m = _HEXLINE_RE.match(line)
+        if not m:
+            if hexbytes:
+                break  # fine del primo blocco (il frame vero e proprio)
+            continue
+        hexbytes.append(m.group(1).strip().replace(" ", ""))
+    return "".join(hexbytes).upper()
+
+
+def capture_time_bounds(pcap):
+    # "frame.time_epoch > 0", non "None": osservato empiricamente che
+    # qcsuper scrive epoch 0 (1970-01-01) per i frame delle primissime
+    # procedure di una sessione (Attach/Authentication/Security Mode
+    # Command/RRCConnectionSetup, prima che stabilisca il riferimento di
+    # orario) — un solo frame cosi' farebbe collassare min() a 0 e
+    # gonfiare qualunque intervallo calcolato su questi bound (visto su
+    # catture reali: "nessuna riallocazione GUTI in 1788790202s" invece
+    # della vera durata della cattura, pochi minuti). Vedi anche
+    # resolve_ts() sotto per lo stesso problema sui singoli eventi.
+    rows = run_tshark_fields(pcap, "frame.time_epoch > 0", ["frame.time_epoch"])
+    times = []
+    for r in rows:
+        try:
+            times.append(float(r["frame.time_epoch"]))
+        except (KeyError, ValueError):
+            continue
+    if not times:
+        return None, None
+    return min(times), max(times)
+
+
+_EARLIEST_VALID_TS_CACHE = {}
+
+
+def earliest_valid_time(pcap):
+    """Prima timestamp valida (>0) nel pcap — usata come approssimazione
+    per i frame con frame.time_epoch=0 (vedi resolve_ts()), cache per non
+    ripetere la stessa query tshark per ogni occorrenza dello stesso
+    pcap."""
+    if pcap not in _EARLIEST_VALID_TS_CACHE:
+        lo, _ = capture_time_bounds(pcap)
+        _EARLIEST_VALID_TS_CACHE[pcap] = lo
+    return _EARLIEST_VALID_TS_CACHE[pcap]
+
+
+def resolve_ts(pcap, raw_epoch):
+    """Converte il valore grezzo di frame.time_epoch in (timestamp,
+    approssimato). Se il frame non ha una timestamp risolta (0, o
+    assente), ripiega sulla prima timestamp valida dello stesso pcap
+    (l'evento resta comunque contato/loggato, solo con un orario
+    approssimato e segnalato come tale) invece di riportare 0
+    (1970-01-01), fuorviante, o di scartare l'evento."""
+    try:
+        ts = float(raw_epoch)
+    except (TypeError, ValueError):
+        ts = 0.0
+    if ts > 0:
+        return ts, False
+    fallback = earliest_valid_time(pcap)
+    return (fallback if fallback is not None else 0.0), True
+
+
+def mk_occ(cat, evt, ts, level, detail, pcap=None, frame_number=None, raw=""):
+    if not raw and pcap and frame_number:
+        raw = hexdump_for_frame(pcap, frame_number)
+    return Occurrence(cat, evt, float(ts), level, detail, raw)
+
+
+# ---------------------------------------------------------------------
+# rilevatori basati su tshark/pcap
+# ---------------------------------------------------------------------
+
+def simple_tshark_detector(pcap, rule, cat, evt, disp_filter, detail_fn=None, extra_fields=None):
+    if rule is None:
+        return []
+    fields = ["frame.number", "frame.time_epoch"] + (extra_fields or [])
+    rows = run_tshark_fields(pcap, disp_filter, fields)
+    occs = []
+    for r in rows:
+        ts, approx = resolve_ts(pcap, r.get("frame.time_epoch"))
+        detail = detail_fn(r) if detail_fn else (rule["comment"] or f"Evento rilevato: {cat}.{evt}")
+        if approx:
+            detail += " [timestamp diag non risolta per questo frame, orario approssimato all'inizio cattura]"
+        occs.append(mk_occ(cat, evt, ts, rule["level"], detail, pcap, r.get("frame.number")))
+    return occs
+
+
+def detect_rrc_ciphering(pcap, rule):
+    if rule is None:
+        return []
+
+    def detail(r):
+        parts = []
+        if r.get("lte-rrc.cipheringAlgorithm") == "0":
+            parts.append("EEA0")
+        if r.get("lte-rrc.integrityProtAlgorithm") == "0":
+            parts.append("EIA0")
+        base = rule["comment"] or "Cifratura/integrita' nulla in Security Mode Command RRC"
+        return f"{base} ({', '.join(parts)})" if parts else base
+
+    return simple_tshark_detector(
+        pcap, rule, "RRCCiph", "eea0_eia0",
+        "lte-rrc.cipheringAlgorithm==0 or lte-rrc.integrityProtAlgorithm==0",
+        detail_fn=detail,
+        extra_fields=["lte-rrc.cipheringAlgorithm", "lte-rrc.integrityProtAlgorithm"],
+    )
+
+
+def detect_identity_request_imsi(pcap, rule):
+    if rule is None:
+        return []
+    # Semplificazione v1: ogni Identity Request di tipo IMSI (id_type2==1)
+    # e' trattata come candidato, senza verificare che manchi un
+    # Authentication Request precedente nella stessa procedura (vedi
+    # limiti noti in testa al file).
+    return simple_tshark_detector(
+        pcap, rule, "NASId", "unsolicited_identity_imsi",
+        "nas-eps.nas_msg_emm_type==85 and nas-eps.emm.id_type2==1",
+        detail_fn=lambda r: (rule["comment"] or "Identity Request IMSI non sollecitata"),
+    )
+
+
+def detect_forced_downgrade(pcap, rule, cat, evt, filter_expr, target_label):
+    if rule is None:
+        return []
+    return simple_tshark_detector(
+        pcap, rule, cat, evt, filter_expr,
+        detail_fn=lambda r: (rule["comment"] or f"Redirect forzato verso {target_label}"),
+    )
+
+
+def detect_a5_0(pcap, rule):
+    if rule is None:
+        return []
+    return simple_tshark_detector(
+        pcap, rule, "WCDMA3G", "a5_0_2g", "gsm_a.rr.SC==0",
+        detail_fn=lambda r: (rule["comment"] or "A5/0 (nessuna cifratura) accettato su GSM/2G"),
+    )
+
+
+def detect_guti_realloc(pcap, rule):
+    if rule is None:
+        return []
+    rows = run_tshark_fields(pcap, "nas-eps.nas_msg_emm_type==80", ["frame.number", "frame.time_epoch"])
+    events = []
+    for r in rows:
+        ts, _approx = resolve_ts(pcap, r.get("frame.time_epoch"))
+        events.append((ts, r.get("frame.number")))
+    events.sort(key=lambda e: e[0])
+
+    occs = []
+    if len(events) >= 2 and rule["min_interval_s"] > 0:
+        for i in range(1, len(events)):
+            interval = events[i][0] - events[i - 1][0]
+            if interval < rule["min_interval_s"]:
+                detail = (
+                    f"Riallocazione GUTI dopo solo {interval:.0f}s dalla precedente "
+                    f"(soglia minima {rule['min_interval_s']}s)"
+                )
+                occs.append(mk_occ("NASId", "guti_realloc_anomaly", events[i][0], rule["level"],
+                                    detail, pcap, events[i][1]))
+    elif not events and rule["max_interval_s"] > 0:
+        lo, hi = capture_time_bounds(pcap)
+        if lo is not None and (hi - lo) > rule["max_interval_s"]:
+            detail = (
+                f"Nessuna riallocazione GUTI in {hi - lo:.0f}s di cattura "
+                f"(soglia massima {rule['max_interval_s']}s)"
+            )
+            occs.append(mk_occ("NASId", "guti_realloc_anomaly", hi, rule["level"], detail))
+    return occs
+
+
+# ---------------------------------------------------------------------
+# SMSSTK.silent_sms: scansione byte-a-byte del .dlf grezzo
+# ---------------------------------------------------------------------
+
+DLF_TIMESTAMP_OFFSET = datetime(1980, 1, 6, tzinfo=timezone.utc).timestamp()
+
+
+def decode_dlf_timestamp(log_time):
+    """Inverso di dlf_timestamp() in synthetic_test/gen_mdt_dlf.py: i bit
+    alti di log_time sono unita' da 20ms dal 1980-01-06 (i 20 bit bassi
+    sono una mantissa, qui ignorata: precisione a 20ms, sufficiente per i
+    nostri scopi)."""
+    return DLF_TIMESTAMP_OFFSET + (log_time >> 20) / 50.0
+
+
+def iter_dlf_records(data: bytes):
+    """
+    Stesso formato di src/mdt_bitscan.py (a sua volta porta fedele di
+    qcsuper/inputs/dlf_read.py): record consecutivi (log_length u16,
+    log_type u16, log_time u64) + payload. Si ferma in modo silenzioso
+    su una coda troncata.
+    """
+    off = 0
+    n = len(data)
+    while off + 12 <= n:
+        log_length, log_type, log_time = unpack_from("<HHQ", data, off)
+        if log_length < 12 or off + log_length > n:
+            break
+        yield log_type, log_time, data[off + 12: off + log_length]
+        off += log_length
+
+
+def try_parse_sms_deliver(buf, off):
+    """
+    Verifica se buf[off:] inizia con un TPDU SMS-DELIVER plausibile (TS
+    23.040 par. 9.2.2.1): TP-MTI=00, TP-OA di lunghezza/tipo credibili,
+    TP-SCTS con nibble BCD validi (0-9). Ritorna un dict con TP-PID/
+    TP-DCS/lunghezza consumata, o None. Bounded plausibility check nello
+    stesso spirito di src/mdt_bitscan.py (scan_position_candidates/
+    scan_mdt_candidates): non e' un parser TS 24.011/24.301 completo del
+    contenitore CP-DATA/RP-DATA che lo racchiude (non necessario per
+    isolare il solo TP-DCS).
+    """
+    if off + 2 > len(buf):
+        return None
+    first_octet = buf[off]
+    if first_octet & 0x03 != 0x00:  # TP-MTI deve essere 00 (SMS-DELIVER)
+        return None
+    oa_len_digits = buf[off + 1]
+    if not (1 <= oa_len_digits <= 20):
+        return None
+    oa_len_bytes = (oa_len_digits + 1) // 2
+    p = off + 2
+    if p + 1 + oa_len_bytes + 2 + 7 + 1 > len(buf):
+        return None
+    toa = buf[p]
+    if toa & 0x80 == 0:  # bit7 del Type-of-Address e' sempre a 1
+        return None
+    p += 1 + oa_len_bytes
+    tp_pid = buf[p]
+    p += 1
+    tp_dcs = buf[p]
+    p += 1
+    scts = buf[p:p + 7]
+    for b in scts[:6]:
+        if (b & 0x0F) > 9 or ((b >> 4) & 0x0F) > 9:
+            return None
+    return {"tp_pid": tp_pid, "tp_dcs": tp_dcs, "end": p + 7}
+
+
+def classify_tp_dcs_class(dcs):
+    """
+    TS 23.038 par. 4: gruppo "General Data Coding" (bit7-6=00, classe
+    presente solo se bit4=1) o gruppo "Data coding/message class"
+    (bit7-4=1111, classe sempre presente nei bit1-0). Altri gruppi
+    (compressione, message waiting indication, ecc.) non gestiti in
+    questa versione: ritorna None per loro, non e' un errore.
+    """
+    if dcs & 0xC0 == 0x00:
+        if dcs & 0x10:
+            return dcs & 0x03
+        return None
+    if dcs & 0xF0 == 0xF0:
+        return dcs & 0x03
+    return None
+
+
+def detect_silent_sms(dlf_path, rule):
+    if rule is None:
+        return []
+    try:
+        with open(dlf_path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return []
+
+    occs = []
+    for log_type, log_time, payload in iter_dlf_records(data):
+        if log_type not in (LOG_LTE_NAS_EMM_OTA_IN_MSG_LOG_C, LOG_LTE_NAS_EMM_OTA_OUT_MSG_LOG_C):
+            continue
+        if len(payload) <= 4:
+            continue
+        msg = payload[4:]  # header <BBBB> (ext_header_ver/rrc_rel/rrc_ver), poi il messaggio NAS
+        # Gate approssimativo: limita la ricerca del TPDU ai messaggi che
+        # sembrano "Downlink/Uplink NAS Transport" (98/99, i soli che
+        # possono veicolare SMS su NAS-EPS), cercando quel byte nei primi
+        # ottetti (messaggio non protetto, o con un header di sicurezza
+        # semplice gia' rimosso da --decrypt-nas di qcsuper).
+        type_offset = None
+        for i in range(min(8, len(msg))):
+            if msg[i] in (98, 99):
+                type_offset = i
+                break
+        if type_offset is None:
+            continue
+        body = msg[type_offset + 1:]
+        for off in range(len(body)):
+            res = try_parse_sms_deliver(body, off)
+            if res is None:
+                continue
+            msg_class = classify_tp_dcs_class(res["tp_dcs"])
+            if msg_class in (0, 2):
+                detail = (rule["comment"] or "SMS silenziosa (TP-DCS class 0/2)")
+                detail = f"{detail} (TP-DCS=0x{res['tp_dcs']:02x}, classe {msg_class})"
+                raw_hex = body[off:res["end"]].hex().upper()
+                ts = decode_dlf_timestamp(log_time)
+                occs.append(mk_occ("SMSSTK", "silent_sms", ts, rule["level"], detail, raw=raw_hex))
+            break  # un solo candidato per messaggio e' sufficiente
+    return occs
+
+
+# ---------------------------------------------------------------------
+# --test-sms: SMS magica di test (vedi TEST_SMS_* in testa al file) -
+# decoder GSM 7-bit autonomo (TS 23.038), NIENTE dipendenza da pycrate:
+# extra_scan non ha (e non deve acquisire) dipendenze esterne, e' pensato
+# per girare anche sul campo con la sola stdlib + tshark/openssl via
+# subprocess (vedi il resto del file). Tabella verificata in fase di
+# sviluppo contro pycrate_mobile.TS23038 (encode_7b/decode_7b) generando
+# byte di prova e confrontando il decode - stesso spirito "verificato
+# contro l'implementazione di riferimento" gia' usato altrove nel progetto.
+# ---------------------------------------------------------------------
+
+# Alfabeto di default GSM 03.38, indice = valore del settetto (0-127).
+GSM7_BASE_TABLE = (
+    "@£$¥èéùìòÇ\nØø\rÅå"
+    "Δ_ΦΓΛΩΠΨΣΘΞ\x1bÆæßÉ"
+    " !\"#¤%&'()*+,-./"
+    "0123456789:;<=>?"
+    "¡ABCDEFGHIJKLMNO"
+    "PQRSTUVWXYZÄÖÑÜ§"
+    "¿abcdefghijklmno"
+    "pqrstuvwxyzäöñüà"
+)
+GSM7_ESCAPE = 0x1B  # 27: introduce il settetto seguente come carattere della tabella estesa
+# Tabella estesa (TS 23.038 tab. 6.2.1.2.3.1): valore settetto -> carattere.
+GSM7_EXT_TABLE = {
+    10: "\x0c", 13: "\x11", 20: "^", 27: "\x0e",
+    40: "{", 41: "}", 47: "\\", 60: "[", 61: "~", 62: "]", 64: "|", 101: "€",
+}
+
+
+def gsm7_unpack_septets(buf, count):
+    """Spacchetta 'count' settetti (7 bit) da 'buf' (bytes, packing GSM
+    standard: settetti consecutivi impacchettati LSB-first in ottetti).
+    Ritorna una lista di interi 0-127, lunga al massimo 'count' (si ferma
+    prima se 'buf' finisce, invece di sollevare - stesso spirito "fail
+    soft" del resto del file)."""
+    septets = []
+    for i in range(count):
+        bit_off = (i * 7) % 8
+        byte_pos = (i * 7) // 8
+        if byte_pos >= len(buf):
+            break
+        first = buf[byte_pos]
+        if bit_off <= 1:
+            val = (first >> bit_off) & 0x7F
+        else:
+            second = buf[byte_pos + 1] if byte_pos + 1 < len(buf) else 0
+            val = ((first >> bit_off) | (second << (8 - bit_off))) & 0x7F
+        septets.append(val)
+    return septets
+
+
+def gsm7_decode(septets):
+    """Decodifica una lista di settetti (vedi gsm7_unpack_septets) in una
+    stringa, gestendo l'escape verso la tabella estesa (GSM7_ESCAPE)."""
+    chars = []
+    i, n = 0, len(septets)
+    while i < n:
+        v = septets[i]
+        if v == GSM7_ESCAPE and i + 1 < n:
+            ext = GSM7_EXT_TABLE.get(septets[i + 1])
+            if ext is not None:
+                chars.append(ext)
+            i += 2
+            continue
+        chars.append(GSM7_BASE_TABLE[v] if v < len(GSM7_BASE_TABLE) else "?")
+        i += 1
+    return "".join(chars)
+
+
+def is_gsm7_default_alphabet(dcs):
+    """True se il TP-DCS indica l'alfabeto di default a 7 bit (TS 23.038
+    par. 4), sia nel gruppo "General Data Coding" (bit7-6=00, alfabeto nei
+    bit3-2) sia nel gruppo "Message class" (bit7-4=1111, alfabeto nel solo
+    bit2) - stessi due gruppi gia' distinti da classify_tp_dcs_class()
+    sopra, qui pero' serve l'ALFABETO (7-bit si'/no), non la classe."""
+    if dcs & 0xC0 == 0x00:
+        return (dcs >> 2) & 0x03 == 0
+    if dcs & 0xF0 == 0xF0:
+        return dcs & 0x04 == 0
+    return False
+
+
+def detect_test_sms_trigger(dlf_path, rules):
+    """Cerca, nello stesso spazio di ricerca di detect_silent_sms() (NAS
+    EMM OTA -> Downlink/Uplink NAS Transport -> candidato SMS-DELIVER via
+    try_parse_sms_deliver), un SMS VISIBILE normale (qualunque TP-DCS
+    alfabeto 7-bit, NON limitato a class 0/2 come silent_sms) il cui
+    TP-UD decodificato, spazi bianchi esclusi, corrisponde esattamente al
+    testo magico TEST_SMS_TEXT_RE. Se trovato, forza al livello A la
+    categoria indicata dal token (o tutte e 5 con ALL____) - vedi
+    TEST_SMS_* in testa al file e l'override di rules[...]["level"] fatto
+    da cmd_scan() prima di chiamare questa funzione.
+
+    Limite noto v1: gestisce solo TP-UDHI=0 (SMS singolo, senza header
+    dati utente/concatenazione) - il messaggio di test e' ~70 caratteri,
+    ben sotto il limite di un SMS singolo a 7 bit (160 settetti), un
+    telefono normale non ha motivo di concatenare per inviarlo."""
+    try:
+        with open(dlf_path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return []
+
+    occs = []
+    for log_type, log_time, payload in iter_dlf_records(data):
+        if log_type not in (LOG_LTE_NAS_EMM_OTA_IN_MSG_LOG_C, LOG_LTE_NAS_EMM_OTA_OUT_MSG_LOG_C):
+            continue
+        if len(payload) <= 4:
+            continue
+        msg = payload[4:]
+        type_offset = None
+        for i in range(min(8, len(msg))):
+            if msg[i] in (98, 99):
+                type_offset = i
+                break
+        if type_offset is None:
+            continue
+        body = msg[type_offset + 1:]
+        for off in range(len(body)):
+            res = try_parse_sms_deliver(body, off)
+            if res is None:
+                continue
+            udhi = bool(body[off] & 0x40)
+            udl_pos = res["end"]
+            if not udhi and is_gsm7_default_alphabet(res["tp_dcs"]) and udl_pos < len(body):
+                udl = body[udl_pos]
+                packed = body[udl_pos + 1:]
+                needed_bytes = (udl * 7 + 7) // 8
+                if len(packed) >= needed_bytes:
+                    septets = gsm7_unpack_septets(packed, udl)
+                    text = gsm7_decode(septets)
+                    stripped = re.sub(r"\s+", "", text)
+                    m = TEST_SMS_TEXT_RE.match(stripped)
+                    if m:
+                        token = m.group(1)
+                        if token == TEST_SMS_ALL_TOKEN:
+                            cats = list(dict.fromkeys(TEST_SMS_CATEGORY_TOKENS.values()))
+                        elif token in TEST_SMS_CATEGORY_TOKENS:
+                            cats = [TEST_SMS_CATEGORY_TOKENS[token]]
+                        else:
+                            cats = []
+                        ts = decode_dlf_timestamp(log_time)
+                        raw_hex = body[off:udl_pos + 1 + needed_bytes].hex().upper()
+                        for cat in cats:
+                            detail = (
+                                f"[TEST-SMS FORCED] SMS di test rilevata "
+                                f"(token={token}, categoria={cat})"
+                            )
+                            occs.append(mk_occ(cat, TEST_SMS_EVT, ts, "A", detail, raw=raw_hex))
+            break  # un solo candidato TPDU per messaggio e' sufficiente (come detect_silent_sms)
+    return occs
+
+
+# ---------------------------------------------------------------------
+# SMSSTK.simjacker_envelope / NASId.attach_identity_release /
+# cellSys.no_neighbor_list: non ancora implementati in questa versione
+# (vedi "Limiti noti" in testa al file) — restano regole valide/
+# configurabili, semplicemente non producono mai occorrenze per ora.
+# ---------------------------------------------------------------------
+
+def detect_simjacker_envelope(dlf_path, rule):
+    return []
+
+
+def detect_attach_identity_release(pcap, rule):
+    return []
+
+
+def detect_no_neighbor_list(pcap, rule):
+    return []
+
+
+# ---------------------------------------------------------------------
+# GPSLoc.cell_gps_incoherent: correlazione cella/GPS da
+# periodic_cell_gps_decoded.csv (nessuna dipendenza da tshark/pcap)
+# ---------------------------------------------------------------------
+
+def haversine_m(lat1, lon1, lat2, lon2):
+    r = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def parse_utc_ts(s):
+    try:
+        return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def detect_gps_incoherence(csv_path, rule):
+    if rule is None or not csv_path or not os.path.isfile(csv_path):
+        return []
+
+    # Soglie interne (non ancora esposte in extra_configs/: candidate per
+    # una revisione futura, vedi "I test extra sono soggetti a
+    # modifiche"): sotto STATIONARY_M ci si considera "fermi", sopra
+    # JUMP_M uno spostamento "significativo".
+    STATIONARY_M = 30.0
+    JUMP_M = 5000.0
+
+    samples = []
+    try:
+        with open(csv_path, newline="") as f:
+            for row in csv.DictReader(f):
+                if row.get("gps_fix") != "1":
+                    continue
+                try:
+                    lat = float(row["gps_lat"])
+                    lon = float(row["gps_lon"])
+                except (KeyError, ValueError, TypeError):
+                    continue
+                if lat == 0 and lon == 0:
+                    continue
+                ts = parse_utc_ts(row.get("utc_timestamp", ""))
+                if ts is None:
+                    continue
+                cell = (row.get("cell_id", ""), row.get("pci", ""))
+                samples.append((ts, cell, lat, lon))
+    except OSError:
+        return []
+
+    occs = []
+    for i in range(1, len(samples)):
+        ts0, cell0, lat0, lon0 = samples[i - 1]
+        ts1, cell1, lat1, lon1 = samples[i]
+        if not cell0[0] or not cell1[0]:
+            continue
+        dist = haversine_m(lat0, lon0, lat1, lon1)
+        if cell0 != cell1 and dist < STATIONARY_M:
+            detail = (
+                f"Cambio cella ({cell0[0]}/{cell0[1]} -> {cell1[0]}/{cell1[1]}) "
+                f"con spostamento GPS trascurabile ({dist:.0f} m)"
+            )
+            occs.append(mk_occ("GPSLoc", "cell_gps_incoherent", ts1, rule["level"], detail))
+        elif cell0 == cell1 and dist > JUMP_M:
+            detail = (
+                f"Cella invariata ({cell1[0]}/{cell1[1]}) nonostante uno spostamento GPS "
+                f"di {dist / 1000:.1f} km"
+            )
+            occs.append(mk_occ("GPSLoc", "cell_gps_incoherent", ts1, rule["level"], detail))
+    return occs
+
+
+# ---------------------------------------------------------------------
+# aggregazione: conteggio per regola/categoria, promozione C->A,
+# livello piu' alto per categoria ed extraLevel complessivo
+# ---------------------------------------------------------------------
+
+def densest_window_count(sorted_ts, window_s):
+    """Massimo numero di timestamp (ordinati) contenuti in una finestra
+    scorrevole di window_s secondi (two-pointer, O(n))."""
+    best = 0
+    start = 0
+    for i in range(len(sorted_ts)):
+        while sorted_ts[i] - sorted_ts[start] > window_s:
+            start += 1
+        best = max(best, i - start + 1)
+    return best
+
+
+def aggregate(rules, occ_by_rule):
+    cat_level = {k: "I" for k in CATEGORY_KEYS}
+    cat_count = {k: 0 for k in CATEGORY_KEYS}
+    rule_results = []  # (cat, evt, base_level, final_level, count, promoted, counted)
+
+    for (cat, evt), rule in rules.items():
+        raw_ts = sorted(occ_by_rule.get((cat, evt), []))
+        n = len(raw_ts)
+        counted = n >= rule["min"]
+        level = rule["level"]
+        promoted = False
+        if counted:
+            if level == "C" and rule["cum_threshold"] > 0 and n > 0:
+                window = rule["window_s"] if rule["window_s"] > 0 else (raw_ts[-1] - raw_ts[0] + 1)
+                dense = densest_window_count(raw_ts, window)
+                if dense >= rule["cum_threshold"]:
+                    level = "A"
+                    promoted = True
+            if cat in cat_count:
+                cat_count[cat] += n
+                if LEVEL_RANK[level] > LEVEL_RANK[cat_level[cat]]:
+                    cat_level[cat] = level
+        rule_results.append((cat, evt, rule["level"], level, n, promoted, counted))
+
+    extra_level = "I"
+    for lvl in cat_level.values():
+        if LEVEL_RANK[lvl] > LEVEL_RANK[extra_level]:
+            extra_level = lvl
+    return cat_level, cat_count, rule_results, extra_level
+
+
+# ---------------------------------------------------------------------
+# log (generale + per categoria) e report esteso
+# ---------------------------------------------------------------------
+
+def format_log_line(cat, evt, ts, level, detail, raw):
+    code = make_code(cat, evt)
+    line = f"[{iso(ts)}] {level} {code} Log {detail}\n"
+    if raw:
+        pad = " " * (len(f"[{iso(ts)}] {level} "))
+        line += f"{pad}{code} {raw}\n"
+    return line
+
+
+def write_logs(out_dir, occurrences, rule_results, now):
+    general_path = os.path.join(out_dir, "extra_scan.log")
+    cat_files = {}
+    header = f"[{iso(now)}] I {make_code('SCAN', 'START')} Log Scansione extra_scan avviata\n"
+    try:
+        gf = open(general_path, "w")
+        gf.write(header)
+        for cat in CATEGORY_KEYS:
+            cf = open(os.path.join(out_dir, f"extra_scan_{cat}.log"), "w")
+            cf.write(header)
+            cat_files[cat] = cf
+
+        for o in sorted(occurrences, key=lambda x: x.ts):
+            line = format_log_line(o.cat, o.evt, o.ts, o.level, o.detail, o.raw)
+            gf.write(line)
+            if o.cat in cat_files:
+                cat_files[o.cat].write(line)
+
+        for cat, evt, base_level, final_level, n, promoted, counted in rule_results:
+            if not promoted:
+                continue
+            detail = (
+                f"Soglia cumulativa superata ({n} occorrenze a livello {base_level}): "
+                f"regola {cat}.{evt} promossa da {base_level} ad {final_level}"
+            )
+            line = format_log_line(cat, evt, now.timestamp(), final_level, detail, "")
+            gf.write(line)
+            if cat in cat_files:
+                cat_files[cat].write(line)
+    finally:
+        gf.close()
+        for cf in cat_files.values():
+            cf.close()
+
+
+def write_report(out_dir, rules, warnings, loaded_configs, cat_level, cat_count, rule_results, extra_level, now):
+    path = os.path.join(out_dir, "extra_scan_report.txt")
+    with open(path, "w") as f:
+        f.write(f"=== extra_scan — {iso(now)} ===\n")
+        f.write("Discriminazione iniziale, non un verdetto definitivo (i test extra sono soggetti a modifiche).\n\n")
+        if loaded_configs:
+            f.write("Config lette (in ordine, l'ultima puo' sovrascrivere le precedenti):\n")
+            for c in loaded_configs:
+                f.write(f"  - {c}\n")
+        else:
+            f.write("Nessun file di configurazione trovato in extra_configs/ (usate solo le regole di default vuote).\n")
+        f.write("\n")
+        for w in warnings:
+            f.write(f"ATTENZIONE: {w}\n")
+        if warnings:
+            f.write("\n")
+
+        f.write("Categorie:\n")
+        for cat, label in CATEGORIES:
+            f.write(f"  {cat} ({label}): livello {cat_level[cat]}, {cat_count[cat]} evento/i\n")
+        f.write("\n")
+
+        f.write("Regole valutate:\n")
+        by_cat = defaultdict(list)
+        for cat, evt, base_level, final_level, n, promoted, counted in rule_results:
+            by_cat[cat].append((evt, base_level, final_level, n, promoted, counted))
+        for cat, _ in CATEGORIES:
+            for evt, base_level, final_level, n, promoted, counted in sorted(by_cat.get(cat, [])):
+                comment = rules.get((cat, evt), {}).get("comment", "")
+                if not counted:
+                    note = f"sotto soglia minima ({n} occorrenza/e)" if n else "nessuna occorrenza"
+                    f.write(f"  {cat}.{evt}: {base_level} — {note}")
+                else:
+                    promo_note = f" -> promossa a {final_level}" if promoted else ""
+                    f.write(f"  {cat}.{evt}: {base_level}{promo_note} ({n} occorrenza/e)")
+                if comment:
+                    f.write(f" — {comment}")
+                f.write("\n")
+        f.write(f"\nextraLevel: {extra_level}\n")
+
+
+# ---------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------
+
+def parse_args(argv):
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("--get-defs", action="store_true",
+                     help="stampa le categorie (CHIAVE testo) e termina, ignora ogni altro argomento")
+    ap.add_argument("--op", default="", help="operatore (extra_configs/op/<op>.conf)")
+    ap.add_argument("--mcc", default="", help="MCC di rete (con --mnc, in alternativa a --op)")
+    ap.add_argument("--mnc", default="", help="MNC di rete (con --mcc)")
+    ap.add_argument("--profile", default="", help="profilo (extra_configs/profile/<profile>.conf)")
+    ap.add_argument("--file", default="", help="file .dlf della cattura")
+    ap.add_argument("--out", default="", help="directory di output (report/log)")
+    ap.add_argument("--configs-dir", default=DEFAULT_CONFIGS_DIR,
+                     help=f"directory extra_configs/ da usare (default: {DEFAULT_CONFIGS_DIR})")
+    ap.add_argument("--test-sms", action="store_true",
+                     help="cerca un SMS di test magico (vedi detect_test_sms_trigger) e forza "
+                          "la categoria indicata al livello A - SOLO per verifica end-to-end "
+                          "controllata, mai attivo di default")
+    return ap.parse_args(argv)
+
+
+def cmd_scan(args):
+    now = datetime.now(timezone.utc)
+    warnings = []
+
+    if not args.file:
+        warnings.append("--file non indicato: nessuna scansione .dlf/pcap possibile.")
+    if not args.out:
+        print("extra_scan: --out obbligatorio (fuori da --get-defs)", file=sys.stderr)
+        for cat in CATEGORY_KEYS:
+            print(f"{cat}_L=I")
+            print(f"{cat}_N=0")
+        print("extraLevel=I")
+        return 1
+    if not args.op and not (args.mcc and args.mnc):
+        warnings.append("ne' --op ne' --mcc/--mnc indicati: nessun file extra_configs/op/ risolto.")
+
+    os.makedirs(args.out, exist_ok=True)
+
+    cp, loaded_configs = load_config(args.configs_dir, args.op, args.profile, args.mcc, args.mnc)
+    rules = build_rules(cp)
+
+    if args.test_sms:
+        # Garanzia ASSOLUTA (indipendente da main.conf/op/profile, vedi
+        # TEST_SMS_EVT in testa al file): il livello finale di una
+        # categoria in aggregate() viene SEMPRE da rules[...]["level"], mai
+        # da Occurrence.level - quindi forziamo qui, in memoria, level=A e
+        # min=1 per le nostre 5 regole riservate, creandole se assenti
+        # (main.conf le definisce gia' con questi stessi valori, per
+        # documentazione, ma questo override non dipende da quel file).
+        for cat in TEST_SMS_CATEGORY_TOKENS.values():
+            rule = rules.setdefault((cat, TEST_SMS_EVT), {})
+            rule["level"] = "A"
+            rule["min"] = 1
+            rule.setdefault("max", 0)
+            rule.setdefault("window_s", cp.getint("DEFAULT", "window_s", fallback=900))
+            rule.setdefault("cum_threshold", 0)
+            rule.setdefault("min_interval_s", 0)
+            rule.setdefault("max_interval_s", 0)
+            rule.setdefault("mode", "")
+            rule.setdefault("comment", "Trigger di test via SMS magica (--test-sms)")
+            rule.setdefault("log_msg", "")
+
+    pcap, pcap_err = ensure_pcap(args.file, args.out) if args.file else (None, None)
+    if pcap_err:
+        warnings.append(pcap_err)
+
+    occurrences = []
+    if pcap:
+        occurrences += detect_rrc_ciphering(pcap, rules.get(("RRCCiph", "eea0_eia0")))
+        occurrences += detect_identity_request_imsi(pcap, rules.get(("NASId", "unsolicited_identity_imsi")))
+        occurrences += detect_guti_realloc(pcap, rules.get(("NASId", "guti_realloc_anomaly")))
+        occurrences += detect_attach_identity_release(pcap, rules.get(("NASId", "attach_identity_release")))
+        occurrences += detect_forced_downgrade(
+            pcap, rules.get(("cellSys", "forced_2g_downgrade")), "cellSys", "forced_2g_downgrade",
+            "lte-rrc.redirectedCarrierInfo==1", "2G/GERAN",
+        )
+        occurrences += detect_no_neighbor_list(pcap, rules.get(("cellSys", "no_neighbor_list")))
+        occurrences += detect_forced_downgrade(
+            pcap, rules.get(("WCDMA3G", "forced_3g_downgrade")), "WCDMA3G", "forced_3g_downgrade",
+            "lte-rrc.redirectedCarrierInfo==2 or lte-rrc.redirectedCarrierInfo==3 or lte-rrc.redirectedCarrierInfo==6",
+            "3G/UMTS",
+        )
+        occurrences += detect_a5_0(pcap, rules.get(("WCDMA3G", "a5_0_2g")))
+    else:
+        warnings.append("nessun pcap disponibile: rilevatori basati su tshark saltati (RRCCiph/NASId/cellSys/WCDMA3G).")
+
+    if args.file and os.path.isfile(args.file):
+        occurrences += detect_silent_sms(args.file, rules.get(("SMSSTK", "silent_sms")))
+        occurrences += detect_simjacker_envelope(args.file, rules.get(("SMSSTK", "simjacker_envelope")))
+        if args.test_sms:
+            occurrences += detect_test_sms_trigger(args.file, rules)
+
+    gps_csv = os.path.join(args.out, "periodic_cell_gps_decoded.csv")
+    occurrences += detect_gps_incoherence(gps_csv, rules.get(("GPSLoc", "cell_gps_incoherent")))
+
+    occ_by_rule = defaultdict(list)
+    for o in occurrences:
+        occ_by_rule[(o.cat, o.evt)].append(o.ts)
+
+    cat_level, cat_count, rule_results, extra_level = aggregate(rules, occ_by_rule)
+
+    write_logs(args.out, occurrences, rule_results, now)
+    write_report(args.out, rules, warnings, loaded_configs, cat_level, cat_count, rule_results, extra_level, now)
+
+    for cat in CATEGORY_KEYS:
+        print(f"{cat}_L={cat_level[cat]}")
+        print(f"{cat}_N={cat_count[cat]}")
+    print(f"extraLevel={extra_level}")
+    return 0
+
+
+def main():
+    argv = sys.argv[1:]
+    if "--get-defs" in argv:
+        return cmd_get_defs()
+    args = parse_args(argv)
+    try:
+        return cmd_scan(args)
+    except Exception as exc:  # fail-soft: mai un traceback su stdout/verso mdtcap
+        print(f"extra_scan: errore interno non gestito: {exc}", file=sys.stderr)
+        for cat in CATEGORY_KEYS:
+            print(f"{cat}_L=I")
+            print(f"{cat}_N=0")
+        print("extraLevel=I")
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

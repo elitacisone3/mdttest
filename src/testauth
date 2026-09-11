@@ -1,0 +1,592 @@
+#!/usr/bin/env python3
+"""
+testauth — verifica (o genera) un'autorizzazione firmata GPG al cambio
+IMEI, per il momento testata separatamente (non ancora richiamata da
+mdtimei/mdtcap).
+
+Catena di fiducia
+------------------
+La chiave radice e' in src/res/auth.pub (accanto a questo script). Il
+file di autorizzazione (default: mdt_configs/imei_auth, accanto alla
+directory src/) contiene:
+  - OPZIONALMENTE, un blocco "-----BEGIN PGP PUBLIC KEY BLOCK-----" con
+    una chiave DELEGATA: se presente, deve portare una firma valida
+    della chiave radice (verificata qui con "gpg --check-sigs", NON con
+    il modello di fiducia/ownertrust di gpg — questo script implementa
+    la propria catena di fiducia a un solo livello, root -> delegata,
+    indipendente da qualunque altra chiave nel portachiavi di chi lo
+    esegue);
+  - un messaggio firmato in chiaro ("gpg --clearsign"), che deve essere
+    firmato dalla chiave delegata se presente, altrimenti dalla chiave
+    radice stessa.
+Le due parti si riconoscono dai rispettivi delimitatori ASCII armor
+(BEGIN/END), l'ordine nel file non conta.
+
+Verifica: usa un GNUPGHOME temporaneo, isolato e distrutto a fine
+esecuzione (mai il portachiavi di sistema) — vi si importano SOLO la
+chiave radice e l'eventuale delegata, cosi' la verifica non dipende da
+cos'altro e' gia' presente nel portachiavi di chi esegue lo script.
+
+Formato del messaggio: una riga "CHIAVE: valore" per campo.
+  FROM: yyyy/mm/dd   — l'autorizzazione vale da questa data in poi
+  TO:   yyyy/mm/dd   — l'autorizzazione vale fino a questa data inclusa
+  AUTH: stringa      — non e' un controllo: e' il valore stampato in
+                       caso di successo ("*" stampa una riga vuota)
+  Qualunque altra CHIAVE (es. DEVID/ICCID/IMEI/CONTRACT, o una qualunque
+  altra scelta liberamente) puo' comparire una o piu' volte: se compare
+  almeno una volta, il corrispondente parametro --CHIAVE sulla riga di
+  comando diventa obbligatorio e deve corrispondere ad ALMENO UNO dei
+  valori elencati nel messaggio per quella chiave.
+
+--add ICCID:IMEI (solo --create, ripetibile): autorizza in blocco
+  coppie ICCID:IMEI specifiche SENZA doverne calcolare il contractId una
+  per una (alternativa a --CONTRACT, vedi sotto). Al primo --add viene
+  generato un valore casuale RAND (almeno 16 byte, poi codificato
+  base64 SENZA il padding "="), scritto una sola volta nel messaggio
+  come campo "RAND: valore"; ogni --add aggiunge poi un campo separato
+  "COMBO: valore", con valore l'hash RIPEMD-160 esadecimale della
+  stringa "RAND:ICCID:IMEI" (con RAND quello appena generato). RAND/COMBO
+  non passano dal controllo generico sopra (non richiedono un
+  corrispondente --RAND/--COMBO in verifica).
+  In verifica: se il messaggio contiene almeno un campo COMBO, --ICCID e
+  --IMEI vengono usati per ricalcolare la stessa stringa con il RAND
+  letto dal messaggio — se il risultato compare fra i COMBO elencati,
+  l'autorizzazione e' concessa per QUELLA via. Se il messaggio contiene
+  anche CONTRACT, le due vie (contractId specifico, combinazione
+  ICCID:IMEI) sono ALTERNATIVE fra loro: basta che una delle due
+  corrisponda; l'autorizzazione e' negata solo se nessuna delle due
+  presenti nel messaggio corrisponde.
+
+Uso:
+    testauth --DEVID xxx --ICCID yyy --IMEI zzz --CONTRACT www
+    testauth --mock-time 2026/06/15 --DEVID xxx   # test, exit 77 se autorizzato
+    testauth --create KEYID --FROM 2026/01/01 --TO 2026/12/31 \\
+        --DEVID xxx --AUTH "ok" > mdt_configs/imei_auth
+    testauth --create KEYID --FROM 2026/01/01 --TO 2026/12/31 \\
+        --AUTH "ok" --add 8939...001:35...001 --add 8939...002:35...002 \\
+        > mdt_configs/imei_auth
+
+Uscita: il valore di AUTH su stdout ed exit 0 se tutti i controlli
+passano; errore su stderr ed exit diverso da 0 altrimenti (vedi EXIT_*
+sotto). Con --mock-time, un successo (che sarebbe exit 0) diventa exit
+77 — cosi' uno script chiamante non puo' scambiare per errore
+un'esecuzione di test per un'autorizzazione vera. Un fallimento resta
+invece EXIT_ERROR anche con --mock-time: e' gia' inequivocabile.
+"""
+import base64
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_PUBKEY_FILE = os.path.join(SCRIPT_DIR, "res", "auth.pub")
+DEFAULT_AUTH_FILE = os.path.join(SCRIPT_DIR, "..", "mdt_configs", "imei_auth")
+
+# Chiavi del messaggio che NON passano dal controllo generico "il
+# parametro --CHIAVE deve corrispondere a un valore elencato": FROM/TO
+# hanno la propria logica di intervallo di date, AUTH e' l'output, non
+# un controllo, CONTRACT/RAND/COMBO hanno la propria logica combinata
+# (vedi check_contract_or_combo()) — CONTRACT incluso qui perche' con
+# --add diventa una via ALTERNATIVA alla combinazione ICCID:IMEI, non
+# piu' un requisito sempre obbligatorio quando presente.
+NON_GENERIC_KEYS = ("FROM", "TO", "AUTH", "CONTRACT", "RAND", "COMBO")
+
+RAND_BYTES = 16  # minimo richiesto per RAND (--add), prima della codifica base64
+
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_USAGE = 2
+EXIT_MOCK = 77
+
+PUBKEY_BLOCK_RE = re.compile(
+    r"-----BEGIN PGP PUBLIC KEY BLOCK-----.*?-----END PGP PUBLIC KEY BLOCK-----\n?",
+    re.DOTALL,
+)
+# Il clearsign di gpg non ha un delimitatore "END PGP SIGNED MESSAGE":
+# il blocco intero (testo in chiaro + firma) va da BEGIN SIGNED MESSAGE
+# a END SIGNATURE.
+SIGNED_MESSAGE_RE = re.compile(
+    r"-----BEGIN PGP SIGNED MESSAGE-----.*?-----END PGP SIGNATURE-----\n?",
+    re.DOTALL,
+)
+
+FIELD_LINE_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*):[ \t]?(.*)$")
+
+
+class UsageError(Exception):
+    """Errore di sintassi sulla riga di comando (exit EXIT_USAGE)."""
+
+
+class AuthError(Exception):
+    """Firma/chiave non valida, controllo fallito, file mancante (exit EXIT_ERROR)."""
+
+
+def parse_date(value, what):
+    try:
+        return datetime.strptime(value, "%Y/%m/%d").date()
+    except ValueError:
+        raise UsageError(f"{what}: data non valida, attesa yyyy/mm/dd: {value!r}")
+
+
+def parse_date_field(value, what):
+    try:
+        return datetime.strptime(value, "%Y/%m/%d").date()
+    except ValueError:
+        raise AuthError(f"campo {what} del messaggio non e' una data valida (yyyy/mm/dd): {value!r}")
+
+
+def parse_argv(argv):
+    opts = {
+        "mode": "verify",
+        "create_keyid": None,
+        "mock_time": None,
+        "auth_file": DEFAULT_AUTH_FILE,
+        "pubkey_file": DEFAULT_PUBKEY_FILE,
+        "params": {},  # CHIAVE -> [valori...], nell'ordine passato sulla riga di comando
+        "adds": [],  # [(ICCID, IMEI), ...] da --add ICCID:IMEI (solo --create), nell'ordine passato
+    }
+    i, n = 0, len(argv)
+    while i < n:
+        arg = argv[i]
+        if arg in ("-h", "--help"):
+            print(__doc__.strip())
+            sys.exit(EXIT_OK)
+        if arg == "--create":
+            if i + 1 >= n:
+                raise UsageError("--create richiede un key id GPG")
+            opts["mode"] = "create"
+            opts["create_keyid"] = argv[i + 1]
+            i += 2
+            continue
+        if arg == "--mock-time":
+            if i + 1 >= n:
+                raise UsageError("--mock-time richiede una data yyyy/mm/dd")
+            opts["mock_time"] = parse_date(argv[i + 1], "--mock-time")
+            i += 2
+            continue
+        if arg == "--auth-file":
+            if i + 1 >= n:
+                raise UsageError("--auth-file richiede un percorso")
+            opts["auth_file"] = argv[i + 1]
+            i += 2
+            continue
+        if arg == "--pubkey":
+            if i + 1 >= n:
+                raise UsageError("--pubkey richiede un percorso")
+            opts["pubkey_file"] = argv[i + 1]
+            i += 2
+            continue
+        if arg == "--add":
+            if i + 1 >= n:
+                raise UsageError("--add richiede un valore ICCID:IMEI")
+            value = argv[i + 1]
+            iccid, sep, imei = value.partition(":")
+            if sep != ":" or not iccid or not imei:
+                raise UsageError(f"--add: formato atteso ICCID:IMEI, ricevuto: {value!r}")
+            opts["adds"].append((iccid, imei))
+            i += 2
+            continue
+        if arg.startswith("--") and len(arg) > 2:
+            key = arg[2:]
+            if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
+                raise UsageError(f"nome di parametro non valido: {arg}")
+            if i + 1 >= n:
+                raise UsageError(f"manca il valore per {arg}")
+            opts["params"].setdefault(key, []).append(argv[i + 1])
+            i += 2
+            continue
+        raise UsageError(f"argomento sconosciuto: {arg}")
+    return opts
+
+
+# ---- helper GPG -----------------------------------------------------------
+
+
+def _run_gpg(args, gnupghome=None, input_bytes=None):
+    env = os.environ.copy()
+    if gnupghome is not None:
+        env["GNUPGHOME"] = gnupghome
+    return subprocess.run(
+        ["gpg", "--batch", "--yes", "--no-tty", "--pinentry-mode", "loopback", *args],
+        input=input_bytes,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+
+
+def _run_gpg_interactive(args, input_bytes=None):
+    """
+    Come _run_gpg(), ma SENZA "--batch --no-tty --pinentry-mode loopback":
+    usata solo per operazioni con la chiave PRIVATA di firma in --create
+    (clearsign_message()), che puo' essere protetta da passphrase. Con
+    "--batch" gpg si rifiuta di chiederla ("Sorry, we are in batchmode -
+    can't get input"), anche in loopback, se non gli si fornisce un
+    --passphrase-fd — qui invece si lascia che gpg-agent invochi il suo
+    pinentry normale (apre /dev/tty per conto proprio, indipendente dagli
+    stdin/stdout di questo processo, qui occupati dal testo del
+    messaggio/dall'output firmato) esattamente come farebbe "gpg
+    --clearsign" lanciato a mano in un terminale interattivo. Mai usata
+    in verify (do_verify()): li' si maneggiano solo chiavi PUBBLICHE, mai
+    serve una passphrase, e si vuole restare rigorosamente non
+    interattivi/riproducibili.
+
+    Imposta anche GPG_TTY sul terminale di QUESTA esecuzione: senza,
+    pinentry-curses puo' fallire con un errore ioctl del tutto simile
+    (terminale sbagliato/assente) anche in una shell interattiva vera,
+    se GPG_TTY non e' gia' stato esportato (o punta a un terminale di
+    una sessione precedente) — stesso accorgimento raccomandato dalla
+    documentazione di gpg-agent per qualunque programma che lo invochi.
+    Se non c'e' alcun terminale (stdin non e' una tty: eseguito da uno
+    script/una pipe), pinentry-curses non potra' comunque funzionare —
+    nessun rimedio possibile da qui, l'errore restera' visibile
+    nell'eccezione sollevata sotto.
+    """
+    env = os.environ.copy()
+    try:
+        env["GPG_TTY"] = os.ttyname(sys.stdin.fileno())
+    except OSError:
+        pass
+    return subprocess.run(
+        ["gpg", "--yes", *args],
+        input=input_bytes,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+
+
+def key_fingerprint(key_bytes):
+    """
+    Ricava l'impronta di una chiave GPG SENZA importarla in nessun
+    portachiavi ("--dry-run --import-options show-only"): usato sia per
+    la chiave radice sia per l'eventuale delegata, prima ancora di
+    decidere se sono valide.
+    """
+    proc = _run_gpg(["--with-colons", "--import-options", "show-only", "--dry-run", "--import"], input_bytes=key_bytes)
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        fields = line.split(":")
+        if fields[0] == "fpr" and len(fields) > 9 and fields[9]:
+            return fields[9].upper()
+    return None
+
+
+def import_key(gnupghome, key_bytes):
+    proc = _run_gpg(["--import"], gnupghome=gnupghome, input_bytes=key_bytes)
+    if proc.returncode != 0:
+        raise AuthError("import della chiave GPG fallito: " + proc.stderr.decode("utf-8", "replace").strip())
+
+
+def is_signed_by(gnupghome, target_fpr, issuer_fpr):
+    """
+    True se, nel GNUPGHOME indicato, la chiave target_fpr porta una
+    firma VALIDA (crittograficamente verificata da gpg, non solo
+    presente) della chiave issuer_fpr. Usa "--check-sigs" (verifica le
+    firme) e non "--list-sigs" (le elencherebbe soltanto, senza
+    verificarle) — vedi la colonna di validita' ('!') nell'output
+    --with-colons.
+
+    "--allow-weak-key-signatures" e' necessario per chiavi radice DSA
+    (come src/res/auth.pub, dsa1024): DSA si accoppia naturalmente con
+    SHA-1 (stesso ordine di sottogruppo, 160 bit) e senza questo flag
+    GnuPG >= 2.2.31 rifiuta a priori qualunque firma di terze parti
+    (certificazione su un'ALTRA chiave, esattamente il nostro caso
+    root->delegata) fatta con SHA-1, riportando validita' '%' invece di
+    '!' — verificato empiricamente con la vera src/res/auth.pub. Non
+    riguarda la firma del MESSAGGIO (quella la fa la chiave delegata su
+    un documento, non su un'altra chiave: politica diversa in GnuPG).
+    """
+    proc = _run_gpg(["--with-colons", "--check-sigs", "--allow-weak-key-signatures", target_fpr], gnupghome=gnupghome)
+    issuer_tail = issuer_fpr[-16:].upper()
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        fields = line.split(":")
+        if fields[0] != "sig" or len(fields) < 5:
+            continue
+        validity = fields[1]
+        issuer_keyid = fields[4].upper()
+        issuer_fpr_field = fields[12].upper() if len(fields) > 12 else ""
+        if validity == "!" and (issuer_keyid == issuer_tail or issuer_fpr_field == issuer_fpr):
+            return True
+    return False
+
+
+def verify_clearsigned(gnupghome, message_text):
+    """
+    Verifica un messaggio "--clearsign" e ne ritorna il testo in chiaro
+    insieme all'impronta di chi l'ha firmato — (None, None) se la firma
+    e' assente/non valida (BADSIG/ERRSIG, o nessun VALIDSIG). Usa
+    "--decrypt" (non "--verify"): per un messaggio clearsign, e' l'unico
+    modo per ottenere in un colpo solo sia il testo in chiaro sia
+    l'esito della verifica (via "--status-file", canale separato da
+    stdout/stderr per non doverne fare il parsing insieme a diagnostica
+    umana).
+    """
+    fd, status_path = tempfile.mkstemp(prefix="testauth-status-")
+    os.close(fd)
+    try:
+        proc = _run_gpg(
+            ["--status-file", status_path, "--decrypt"],
+            gnupghome=gnupghome,
+            input_bytes=message_text.encode("utf-8"),
+        )
+        plaintext = proc.stdout.decode("utf-8", "replace")
+        with open(status_path, "r", errors="replace") as f:
+            status_lines = f.readlines()
+    finally:
+        os.unlink(status_path)
+
+    signer_fpr, bad = None, False
+    for line in status_lines:
+        line = line.strip()
+        if line.startswith("[GNUPG:] VALIDSIG"):
+            parts = line.split()
+            if len(parts) > 2:
+                signer_fpr = parts[2].upper()
+        elif line.startswith("[GNUPG:] BADSIG") or line.startswith("[GNUPG:] ERRSIG"):
+            bad = True
+    if bad or signer_fpr is None:
+        return None, None
+    return plaintext, signer_fpr
+
+
+# ---- messaggio --------------------------------------------------------
+
+
+def split_armor_blocks(text):
+    pk_match = PUBKEY_BLOCK_RE.search(text)
+    msg_match = SIGNED_MESSAGE_RE.search(text)
+    return (
+        pk_match.group(0) if pk_match else None,
+        msg_match.group(0) if msg_match else None,
+    )
+
+
+def parse_message(text):
+    fields = {}
+    for line in text.splitlines():
+        m = FIELD_LINE_RE.match(line)
+        if not m:
+            continue
+        fields.setdefault(m.group(1), []).append(m.group(2))
+    return fields
+
+
+def today(mock_time):
+    return mock_time if mock_time is not None else datetime.now(timezone.utc).date()
+
+
+def check_dates(fields, mock_time):
+    now = today(mock_time)
+    if "FROM" in fields:
+        from_date = parse_date_field(fields["FROM"][-1], "FROM")
+        if now < from_date:
+            raise AuthError(f"autorizzazione non ancora valida (FROM: {fields['FROM'][-1]})")
+    if "TO" in fields:
+        to_date = parse_date_field(fields["TO"][-1], "TO")
+        if now > to_date:
+            raise AuthError(f"autorizzazione scaduta (TO: {fields['TO'][-1]})")
+
+
+def check_generic_fields(fields, params):
+    """
+    Per OGNI chiave del messaggio diversa da NON_GENERIC_KEYS: se compare
+    (una o piu' volte), il parametro --CHIAVE e' obbligatorio e deve
+    corrispondere ad almeno uno dei valori elencati (stessa logica per
+    DEVID/ICCID/IMEI e per qualunque altra chiave scelta liberamente in
+    fase di --create — CONTRACT escluso: vedi check_contract_or_combo()).
+    """
+    for key, allowed_values in fields.items():
+        if key in NON_GENERIC_KEYS:
+            continue
+        given = params.get(key)
+        if not given:
+            raise AuthError(f"parametro mancante: --{key} (richiesto dal messaggio di autorizzazione)")
+        if given[-1] not in allowed_values:
+            raise AuthError(f"valore non valido per --{key}")
+
+
+def ripemd160_hex(text):
+    """
+    Hash RIPEMD-160 esadecimale minuscolo di "text" (UTF-8), via il
+    binario di sistema "openssl" (stesso approccio di mdtcap/mdtcontract/
+    evidence.py — mai hashlib.new("ripemd160"): su OpenSSL 3.x senza il
+    "legacy provider" abilitato l'algoritmo puo' non essere registrato
+    nemmeno li', vedi il controllo "openssl dgst -rmd160" in install.sh).
+    """
+    proc = subprocess.run(
+        ["openssl", "dgst", "-rmd160", "-r"],
+        input=text.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if proc.returncode != 0:
+        raise AuthError("calcolo RIPEMD-160 fallito: " + proc.stderr.decode("utf-8", "replace").strip())
+    return proc.stdout.decode("ascii").split()[0]
+
+
+def check_contract_or_combo(fields, params):
+    """
+    CONTRACT (contractId specifico) e COMBO (combinazione ICCID:IMEI,
+    creata con uno o piu' --add in fase di --create — vedi do_create())
+    sono due vie ALTERNATIVE con cui un'autorizzazione puo' riconoscere
+    questo device+SIM: basta che UNA delle due, se presente nel
+    messaggio, corrisponda. Se il messaggio non contiene ne' l'una ne'
+    l'altra, questo controllo non si applica affatto (autorizzazione che
+    non usa ne' --CONTRACT ne' --add in fase di --create).
+    """
+    contract_values = fields.get("CONTRACT")
+    combo_values = fields.get("COMBO")
+    if not contract_values and not combo_values:
+        return
+
+    if contract_values:
+        given_contract = params.get("CONTRACT")
+        if given_contract and given_contract[-1] in contract_values:
+            return  # autorizzato: contractId specifico
+
+    if combo_values:
+        rand_values = fields.get("RAND")
+        given_iccid = params.get("ICCID")
+        given_imei = params.get("IMEI")
+        if rand_values and given_iccid and given_imei:
+            expected_combo = ripemd160_hex(f"{rand_values[-1]}:{given_iccid[-1]}:{given_imei[-1]}")
+            if expected_combo in combo_values:
+                return  # autorizzato: combinazione ICCID:IMEI
+
+    raise AuthError(
+        "nessun contractId specifico (--CONTRACT) ne' combinazione ICCID:IMEI valida "
+        "(--ICCID/--IMEI) trovata nell'autorizzazione"
+    )
+
+
+def do_verify(opts):
+    pubkey_file = opts["pubkey_file"]
+    auth_file = opts["auth_file"]
+
+    if not os.path.isfile(pubkey_file):
+        raise AuthError(f"chiave pubblica non trovata: {pubkey_file}")
+    if not os.path.isfile(auth_file):
+        raise AuthError(f"file di autorizzazione non trovato: {auth_file}")
+
+    with open(pubkey_file, "rb") as f:
+        root_key_bytes = f.read()
+    root_fpr = key_fingerprint(root_key_bytes)
+    if root_fpr is None:
+        raise AuthError(f"chiave pubblica radice non valida: {pubkey_file}")
+
+    with open(auth_file, "r", errors="replace") as f:
+        raw_text = f.read()
+    delegate_block, message_block = split_armor_blocks(raw_text)
+    if message_block is None:
+        raise AuthError(f"nessun messaggio firmato trovato in {auth_file}")
+
+    with tempfile.TemporaryDirectory(prefix="testauth-gnupg-") as gnupghome:
+        os.chmod(gnupghome, 0o700)
+        import_key(gnupghome, root_key_bytes)
+
+        expected_signer_fpr = root_fpr
+        if delegate_block is not None:
+            delegate_fpr = key_fingerprint(delegate_block.encode("utf-8"))
+            if delegate_fpr is None:
+                raise AuthError("chiave delegata nel file di autorizzazione non valida")
+            import_key(gnupghome, delegate_block.encode("utf-8"))
+            if not is_signed_by(gnupghome, delegate_fpr, root_fpr):
+                raise AuthError("la chiave delegata non e' firmata dalla chiave radice (src/res/auth.pub)")
+            expected_signer_fpr = delegate_fpr
+
+        plaintext, signer_fpr = verify_clearsigned(gnupghome, message_block)
+
+    if signer_fpr is None:
+        raise AuthError("firma non valida sul messaggio di autorizzazione")
+    if signer_fpr != expected_signer_fpr:
+        raise AuthError("il messaggio non e' firmato dalla chiave attesa (radice o delegata)")
+
+    fields = parse_message(plaintext)
+    check_dates(fields, opts["mock_time"])
+    check_generic_fields(fields, opts["params"])
+    check_contract_or_combo(fields, opts["params"])
+
+    auth_values = fields.get("AUTH")
+    if not auth_values:
+        raise AuthError("il messaggio di autorizzazione non contiene AUTH")
+    return auth_values[-1]
+
+
+# ---- creazione ----------------------------------------------------------
+
+
+def export_public_key(keyid):
+    proc = _run_gpg(["--armor", "--export", keyid])
+    if proc.returncode != 0 or not proc.stdout.strip():
+        raise AuthError(f"esportazione della chiave pubblica {keyid} fallita: " + proc.stderr.decode("utf-8", "replace").strip())
+    return proc.stdout.decode("utf-8")
+
+
+def clearsign_message(keyid, text):
+    proc = _run_gpg_interactive(["--local-user", keyid, "--clearsign", "--armor"], input_bytes=text.encode("utf-8"))
+    if proc.returncode != 0:
+        raise AuthError(f"firma del messaggio con la chiave {keyid} fallita: " + proc.stderr.decode("utf-8", "replace").strip())
+    return proc.stdout.decode("utf-8")
+
+
+def generate_rand():
+    """RAND (--add): almeno 16 byte casuali, codificati base64 SENZA il
+    padding "=" finale."""
+    return base64.b64encode(os.urandom(RAND_BYTES)).decode("ascii").rstrip("=")
+
+
+def do_create(opts):
+    lines = [f"{key}: {value}" for key, values in opts["params"].items() for value in values]
+
+    if opts["adds"]:
+        rand_value = generate_rand()
+        lines.append(f"RAND: {rand_value}")
+        for iccid, imei in opts["adds"]:
+            combo = ripemd160_hex(f"{rand_value}:{iccid}:{imei}")
+            lines.append(f"COMBO: {combo}")
+
+    message_text = "\n".join(lines) + "\n"
+
+    # Chiave pubblica di firma prima, messaggio firmato poi (separabili
+    # dai delimitatori ASCII armor): e' esattamente il formato che
+    # do_verify()/split_armor_blocks() si aspettano di rileggere come
+    # "chiave delegata" opzionale + messaggio.
+    pubkey_block = export_public_key(opts["create_keyid"])
+    signed_message = clearsign_message(opts["create_keyid"], message_text)
+    return pubkey_block.rstrip("\n") + "\n\n" + signed_message
+
+
+# ---- main -----------------------------------------------------------------
+
+
+def main(argv):
+    try:
+        opts = parse_argv(argv)
+    except UsageError as e:
+        print(f"testauth: {e}", file=sys.stderr)
+        return EXIT_USAGE
+
+    try:
+        if opts["mode"] == "create":
+            sys.stdout.write(do_create(opts))
+        else:
+            auth_value = do_verify(opts)
+            print(auth_value if auth_value != "*" else "")
+    except AuthError as e:
+        print(f"testauth: {e}", file=sys.stderr)
+        return EXIT_ERROR
+
+    # --mock-time forza l'exit code SOLO sul successo (0 -> 77): serve a
+    # rendere impossibile per uno script chiamante scambiare
+    # un'esecuzione di test (con data finta) per un'autorizzazione vera.
+    # Un fallimento resta un fallimento (exit EXIT_ERROR) anche con
+    # --mock-time: e' un esito che nessuno scambierebbe per un successo,
+    # quindi non serve offuscarlo.
+    if opts.get("mock_time") is not None:
+        return EXIT_MOCK
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+#
+# mdtcontract
+#
+# Genera il "contractId": un identificativo univoco che lega insieme
+# QUESTO device di test e la SIM usata per una sessione di test — pensato
+# per essere usato da script ESTERNI a questo progetto per tracciare il
+# consenso al test (chi ha acconsentito, con quale device e quale SIM).
+# Usato anche da mdtcap stesso per il campo "contractId" di manifest.json
+# (vedi li').
+#
+# Calcolato come hash RIPEMD-160, in esadecimale minuscolo, della stringa:
+#
+#   <id hardware device> "\n" <ICCID della SIM>
+#
+# (nessun terminatore dopo l'ICCID). Deterministico: stesso device +
+# stessa SIM = stesso contractId ad ogni esecuzione, su questa macchina.
+#
+# Licenza: GNU General Public License v3.0 (GPLv3) — vedi LICENSE.
+# Autore:  EPTO Tramaci
+#
+# Uso:
+#   ./mdtcontract <ICCID>
+#   ./mdtcontract --get-devid
+#   ./mdtcontract --get-sim-user
+#   ./mdtcontract --get-keys
+#
+# <ICCID>: numero seriale della SIM (es. da "AT+CICCID" — vedi
+#   mdtcap/mdtdiag), unico argomento, obbligatorio (alternativo a
+#   --get-devid/--get-sim-user/--get-keys, non insieme).
+#
+# --get-devid: stampa SOLO l'id hardware del device (la stessa identica
+#   risoluzione usata sotto per il contractId, vedi "Id hardware device"),
+#   senza bisogno di un ICCID — utile per farsi dare da un operatore il
+#   DEVID di QUESTO device prima ancora di aver messo/letto una SIM, es.
+#   per predisporre un'autorizzazione (vedi src/testauth --create, campo
+#   DEVID) da consegnare a chi deve firmarla. E' anche la fonte del campo
+#   DEVID usato da mdtimei (invocato internamente, invece di
+#   duplicare la stessa risoluzione).
+#
+# --get-sim-user: stesso calcolo di "./mdtcontract <ICCID>", ma l'ICCID
+#   non va passato a mano: viene letto da solo eseguendo "mdtdiag
+#   --get-sim" (stessa risoluzione porta AT di mdtdiag:
+#   mdt_configs/system.conf/--autodetect). A differenza delle altre due
+#   modalita' sopra (che non toccano mai il modem), questa RICHIEDE root
+#   e un modem raggiungibile — mdtdiag --get-sim li richiede a sua volta.
+#   Uscita SU DUE RIGHE (diversa dalle altre due modalita', vedi sotto):
+#     ICCID:<iccid>
+#     CONTRACT:<contractId>
+#
+# --get-keys: stampa, su cinque righe "CHIAVE:valore", gli identificativi
+#   esadecimali (fingerprint GPG completa, 40 caratteri esadecimali
+#   maiuscoli) delle chiavi GPG usate da questo progetto, piu' il devId e
+#   un codice di richiesta per la funzionalita' sperimentale di download
+#   configurazione IMEI — pensato per essere consegnato a chi deve
+#   emettere/verificare un'autorizzazione, senza dover andare a cercare
+#   le chiavi/calcolare nulla a mano:
+#     AUTH:<id>   chiave radice, da src/res/auth.pub (Master key: quella
+#                 che firma direttamente o delega le autorizzazioni al
+#                 cambio IMEI, vedi src/testauth)
+#     IMEI:<id>   chiave DELEGATA eventualmente contenuta nel blocco
+#                 "-----BEGIN PGP PUBLIC KEY BLOCK-----" dentro
+#                 mdt_configs/imei_auth (vedi src/testauth per il
+#                 formato di quel file) — NON e' un file di sola chiave:
+#                 l'id e' quello della chiave TROVATA al suo interno, se
+#                 presente
+#     DATA:<id>   chiave per l'invio cifrato delle evidenze, da
+#                 main_configs/data.pub
+#     DVID:<id>   lo stesso devId di --get-devid sopra
+#     CODE:<id>   lo stesso contractId che si otterrebbe lanciando
+#                 "./mdtcontract IMEI_FILE" — "IMEI_FILE" e' una stringa
+#                 letterale (non un vero ICCID), usata cosi' com'e' al
+#                 posto dell'ICCID per ottenere un codice di richiesta
+#                 legato al device ma sempre distinguibile da un vero
+#                 contractId, vedi src/mdtmain_lib/contract.py
+#                 get_imei_token()
+#   Per AUTH/IMEI/DATA: se il rispettivo file sopra non esiste/non e'
+#   leggibile, o (solo per IMEI) non contiene nessuna chiave GPG valida,
+#   il campo resta vuoto ("AUTH:", ecc.) — mai un errore, ne' un'altra
+#   riga mancante: le cinque righe sono SEMPRE tutte presenti.
+#
+# Id hardware device, in ordine di preferenza (primo trovato e non vuoto):
+#   1. /proc/device-tree/serial-number (Raspberry Pi e altri device-tree)
+#   2. /sys/class/dmi/id/product_uuid  (PC con DMI/SMBIOS)
+#   3. /etc/machine-id                 (fallback: generato all'installazione
+#                                        del sistema operativo, presente su
+#                                        quasi ogni Linux anche senza
+#                                        device-tree/DMI leggibili)
+#   I file device-tree (/proc/device-tree/*) sono tipicamente terminati da
+#   un byte NUL: viene rimosso prima dell'uso, cosi' come eventuali
+#   newline finali (irrilevanti per il resto del contenuto).
+#
+# Uscita (stdout): il contractId, 40 caratteri esadecimali minuscoli
+#   (RIPEMD-160), senza newline finale — oppure, con --get-devid, il solo
+#   id hardware del device (formato dipendente dalla fonte: es. un UUID
+#   con /sys/class/dmi/id/product_uuid, una stringa esadecimale con
+#   /proc/device-tree/serial-number), anch'esso senza newline finale —
+#   oppure, con --get-sim-user, le DUE righe "ICCID:<iccid>"/
+#   "CONTRACT:<contractId>" descritte sopra (uniche con newline finale su
+#   ciascuna riga, incluso l'ultima) — oppure, con --get-keys, le CINQUE
+#   righe "AUTH:<id>"/"IMEI:<id>"/"DATA:<id>"/"DVID:<id>"/"CODE:<id>"
+#   descritte sopra (anch'esse con newline finale su ciascuna riga).
+# Uscita (stderr) + exit status:
+#   1  argomenti mancanti/sbagliati (vedi anche --help)
+#   2  un id hardware del device non e' determinabile
+#   3  "openssl" (con supporto RIPEMD-160) non disponibile — non
+#      controllato/non richiesto con --get-devid, che non calcola nessun
+#      hash
+#   4  (solo --get-sim-user) mdtdiag non trovato, o "mdtdiag --get-sim"
+#      fallito (SIM bloccata/assente, porta AT non trovata, non eseguito
+#      come root, ...) — vedi lo stderr di mdtdiag stesso per il dettaglio
+#   5  (solo --get-keys) "gpg" non disponibile — a differenza dei file
+#      chiave mancanti (che lasciano solo il campo vuoto, non e' un
+#      errore), senza gpg nessun campo AUTH/IMEI/DATA e' calcolabile
+
+set -euo pipefail
+
+usage() {
+    sed -n '3,/^set -euo pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
+    exit 1
+}
+
+[[ $# -eq 1 ]] || usage
+[[ "$1" != "-h" && "$1" != "--help" ]] || usage
+
+# Ritorna sullo stdout il contenuto del primo file leggibile e non vuoto
+# tra quelli passati come argomenti, ripulito da eventuali byte NUL e da
+# newline finali. Exit 1 se nessuno dei candidati e' utilizzabile.
+read_first() {
+    local f content
+    for f in "$@"; do
+        [[ -r "$f" ]] || continue
+        content=$(tr -d '\0' < "$f" 2>/dev/null) || continue
+        if [[ -n "$content" ]]; then
+            printf '%s' "$content"
+            return 0
+        fi
+    done
+    return 1
+}
+
+get_hwid() {
+    read_first /proc/device-tree/serial-number /sys/class/dmi/id/product_uuid /etc/machine-id || {
+        echo "Impossibile determinare un id hardware del device: ne' /proc/device-tree/serial-number, ne' /sys/class/dmi/id/product_uuid, ne' /etc/machine-id sono leggibili/non vuoti." >&2
+        exit 2
+    }
+}
+
+if [[ "$1" == "--get-devid" ]]; then
+    get_hwid
+    exit 0
+fi
+
+# Ricava l'id (fingerprint completa, esadecimale maiuscola) della chiave
+# GPG contenuta nel file indicato, SENZA importarla in nessun
+# portachiavi ("--dry-run --import-options show-only", stessa tecnica di
+# src/testauth key_fingerprint()) — stampa una stringa vuota (nessun
+# errore) se il file non esiste/non e' leggibile, o se gpg non vi trova
+# nessuna chiave valida (es. mdt_configs/imei_auth senza il blocco
+# opzionale "-----BEGIN PGP PUBLIC KEY BLOCK-----" della chiave
+# delegata: il resto del file, il messaggio firmato in chiaro, non e' un
+# oggetto GPG che "--import" possa importare). Se il file contiene piu'
+# di una chiave, prende la PRIMA (la sua chiave primaria, non eventuali
+# sottochiavi/chiavi successive).
+get_key_id() {
+    local f="$1"
+    [[ -r "$f" ]] || return 0
+    gpg --batch --with-colons --import-options show-only --dry-run --import "$f" 2>/dev/null \
+        | awk -F: '$1=="fpr" && $10!="" { print toupper($10); exit }' || true
+}
+
+if [[ "$1" == "--get-keys" ]]; then
+    command -v gpg >/dev/null 2>&1 || { echo "Comando richiesto non trovato: gpg" >&2; exit 5; }
+    command -v openssl >/dev/null 2>&1 || { echo "Comando richiesto non trovato: openssl" >&2; exit 3; }
+
+    REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+
+    AUTH_ID=$(get_key_id "$REPO_ROOT/src/res/auth.pub")
+    IMEI_ID=$(get_key_id "$REPO_ROOT/mdt_configs/imei_auth")
+    DATA_ID=$(get_key_id "$REPO_ROOT/main_configs/data.pub")
+
+    HWID=$(get_hwid)
+    # Stesso calcolo di un contractId normale, ma con la stringa
+    # letterale "IMEI_FILE" al posto di un vero ICCID (vedi il commento
+    # --get-keys in testa allo script).
+    CODE=$(printf '%s\n%s' "$HWID" "IMEI_FILE" | openssl dgst -rmd160 -r | awk '{print $1}')
+
+    printf 'AUTH:%s\n' "$AUTH_ID"
+    printf 'IMEI:%s\n' "$IMEI_ID"
+    printf 'DATA:%s\n' "$DATA_ID"
+    printf 'DVID:%s\n' "$HWID"
+    printf 'CODE:%s\n' "$CODE"
+    exit 0
+fi
+
+GET_SIM_USER=0
+if [[ "$1" == "--get-sim-user" ]]; then
+    GET_SIM_USER=1
+    MDTDIAG_BIN="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)/mdtdiag"
+    [[ -f "$MDTDIAG_BIN" ]] || { echo "mdtdiag non trovato: $MDTDIAG_BIN" >&2; exit 4; }
+    SIM_LINE=$("$MDTDIAG_BIN" --get-sim) || {
+        echo "mdtdiag --get-sim fallito (vedi il messaggio sopra per il motivo: SIM bloccata/assente, porta AT non trovata, non eseguito come root, ...)." >&2
+        exit 4
+    }
+    ICCID="${SIM_LINE#ICCID:}"  # mdtdiag --get-sim stampa "ICCID:<valore>", vedi mdtdiag --help
+else
+    ICCID="$1"
+fi
+
+[[ -n "$ICCID" ]] || { echo "ICCID vuoto." >&2; exit 1; }
+
+command -v openssl >/dev/null 2>&1 || { echo "Comando richiesto non trovato: openssl" >&2; exit 3; }
+
+HWID=$(get_hwid)
+
+CONTRACTID=$(printf '%s\n%s' "$HWID" "$ICCID" | openssl dgst -rmd160 -r | awk '{print $1}')
+
+if [[ "$GET_SIM_USER" -eq 1 ]]; then
+    printf 'ICCID:%s\n' "$ICCID"
+    printf 'CONTRACT:%s\n' "$CONTRACTID"
+else
+    printf '%s' "$CONTRACTID"
+fi

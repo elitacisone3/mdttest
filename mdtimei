@@ -1,0 +1,541 @@
+#!/usr/bin/env bash
+#
+# mdtimei
+#
+# ATTENZIONE: cambia l'IMEI del modulo (AT+SIMEI) e riavvia il modulo
+# (AT+CRESET). NON e' un'operazione di sola lettura/diagnostica: leggere
+# doc/GUIDA_LEGALE_IMEI.md (nella cartella di questo script) PRIMA di
+# usarlo fuori da un banco di prova sperimentale isolato.
+#
+# Impostare un NUOVO IMEI (--imei) richiede un'autorizzazione firmata
+# GPG, verificata con src/testauth — vedi li' per il formato di
+# mdt_configs/imei_auth/src/res/auth.pub e la catena di fiducia
+# radice/delegata. Procedura, in ordine:
+#   1. legge l'ICCID della SIM attualmente inserita (AT+CCID) e calcola il
+#      DEVID ("./mdtcontract --get-devid") e il "contractId" (device +
+#      questa SIM, "./mdtcontract <ICCID>");
+#   2. verifica l'autorizzazione con ./src/testauth, passando DEVID,
+#      ICCID, IMEI (quello da IMPOSTARE, non quello attuale: e' cosi' che
+#      un'autorizzazione puo' restringersi a un IMEI target specifico) e
+#      CONTRACT — ABORTISCE senza toccare il modulo se la verifica
+#      fallisce;
+#   3. superata la verifica, chiede di rimuovere FISICAMENTE la SIM dal
+#      modulo e di premere invio per proseguire (cosi' il modulo non ha
+#      mai, nella stessa sessione, sia una SIM live sia un IMEI appena
+#      cambiato, riducendo il rischio di un uso immediato in frode) —
+#      passo non scriptabile via --yes (vedi sotto per l'eccezione);
+#   4. imposta il nuovo IMEI e riavvia.
+# --restore (ripristino dell'IMEI ORIGINALE salvato in mdt_configs/imei)
+# NON passa da nessuno dei passi sopra: nessuna autorizzazione richiesta,
+# solo la conferma esplicita "CONFERMO" (salvo --yes).
+#
+# --mock-time yyyy/mm/dd (passato cosi' com'e' a src/testauth): usa una
+# data finta per il controllo FROM/TO dell'autorizzazione, pensato per
+# testare la CATENA di autorizzazione (lettura ICCID, contractId, esito
+# testauth) senza rischiare l'hardware — con --mock-time lo script si
+# FERMA subito dopo aver stampato l'esito della verifica (testauth
+# ritorna sempre exit 77 con --mock-time, vedi src/testauth --help),
+# MAI arriva a toccare AT+SIMEI/AT+CRESET, indipendentemente dall'esito.
+#
+# Licenza: GNU General Public License v3.0 (GPLv3) — vedi LICENSE.
+# Autore:  EPTO Tramaci
+#
+# Uso:
+#   sudo ./mdtimei --list-ports
+#   sudo ./mdtimei --imei 15CIFRE [--at-port /dev/ttyUSB2 | --autodetect]
+#       [--reset-wait SECONDS] [--yes] [--no-banner]
+#       [--auth-file FILE] [--pubkey FILE] [--mock-time yyyy/mm/dd]
+#   sudo ./mdtimei --restore [--at-port /dev/ttyUSB2 | --autodetect] [--yes]
+#
+# --imei 15CIFRE: il nuovo IMEI da impostare (AT+SIMEI), richiede
+#   un'autorizzazione valida (vedi sopra). Deve essere di 15 cifre
+#   numeriche. Alternativo a --restore (uno dei due e' obbligatorio, non
+#   insieme).
+#
+# --restore: ripristina l'IMEI ORIGINALE salvato in mdt_configs/imei
+#   (vedi sotto), invece di impostarne uno passato esplicitamente con
+#   --imei. Nessuna autorizzazione richiesta. Abortisce se quel file non
+#   esiste ancora (nessun originale da ripristinare) o non contiene un
+#   IMEI valido.
+#
+# --at-port DEV / --autodetect / --autodetect-vendor / --autodetect-model:
+#   stesso significato e stessa logica di mdtcap/mdtgps/mdtdiag
+#   (autodetect prova "AT" su ogni ttyUSB* filtrato per vendor, default
+#   "SimTech"). Se nessuno dei due e' passato, viene letto
+#   --at-port/--autodetect da mdt_configs/system.conf se presente (stesso
+#   file di sistema di mdtcap/mdtgps/mdtdiag, generato da
+#   "sudo ./install.sh --configure-system") — qualunque valore passato
+#   esplicitamente sulla riga di comando vince comunque su quel file.
+#
+# --reset-wait SECONDS (default 90): tempo massimo di attesa, dopo
+#   AT+CRESET, che il modulo torni a rispondere in modo stabile — riapre
+#   la porta ad ogni tentativo risolvendo di nuovo il symlink stabile
+#   /dev/serial/by-id/... del modulo, perche' il reset puo' far
+#   ricomparire il device con un ttyUSB diverso (osservato: puo' avvenire
+#   anche in due fasi, il device risponde per un istante sul vecchio nodo
+#   prima di ricomparire per davvero su uno nuovo — una singola risposta
+#   "OK" non basta quindi a considerare il modulo pronto, viene
+#   riverificata dopo una breve pausa).
+#
+# --yes: con --restore, salta la conferma "scrivi CONFERMO" (utile per
+#   uso scriptato in un banco di prova gia' controllato/isolato). Con
+#   --imei, salta ANCHE il passo "rimuovi la SIM e premi invio" — stampa
+#   comunque un'ATTENZIONE ben visibile quando lo salta, mai in silenzio.
+#   Il banner di rischio iniziale viene SEMPRE stampato, con o senza
+#   --yes: non e' disattivabile.
+#
+# --auth-file FILE (default mdt_configs/imei_auth) / --pubkey FILE
+#   (default src/res/auth.pub): passati cosi' come sono a src/testauth
+#   (vedi "src/testauth --help"), utile per testare con un'autorizzazione/
+#   una chiave radice diverse da quelle reali del progetto.
+#
+# --no-banner: disabilita solo l'intestazione "mdtimei ver ..." (NON il
+#   banner di rischio, sempre presente).
+#
+# mdt_configs/imei: prima di toccare l'IMEI (sia con --imei sia con
+# --restore), se questo file non esiste ancora, lo script vi salva
+# l'IMEI ATTUALE del modulo (AT+CGSN) come backup dell'IMEI di fabbrica —
+# MAI sovrascritto una volta creato, ne' da questo script ne' da
+# mdtcap/install.sh (che fanno lo stesso backup, vedi li' i rispettivi
+# commenti). E' la fonte usata da --restore, e da mdtcap per accorgersi
+# se l'IMEI in uso e' cambiato rispetto all'originale (vedi
+# compute_imei_context() li').
+#
+# Log di sessione: ogni esecuzione scrive (oltre che a schermo) un log
+# completo in log/mdt_imei_logs/mdtimei_<timestamp UTC>.log (cartella
+# creata se non esiste, accanto a questo script).
+
+set -euo pipefail
+
+SCRIPT_VERSION="1.0"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+IMEI_FILE="$SCRIPT_DIR/mdt_configs/imei"
+LOG_DIR="$SCRIPT_DIR/log/mdt_imei_logs"
+TESTAUTH_BIN="$SCRIPT_DIR/src/testauth"
+MDTCONTRACT_BIN="$SCRIPT_DIR/mdtcontract"
+DEFAULT_AUTH_FILE="$SCRIPT_DIR/mdt_configs/imei_auth"
+DEFAULT_PUBKEY_FILE="$SCRIPT_DIR/src/res/auth.pub"
+
+AT_PORT=""
+BAUD=115200
+AUTODETECT=0
+AUTODETECT_VENDOR="SimTech"
+AUTODETECT_MODEL=""
+NEW_IMEI=""
+RESTORE=0
+RESET_WAIT=90
+ASSUME_YES=0
+BANNER_ENABLED=1
+AUTH_FILE="$DEFAULT_AUTH_FILE"
+PUBKEY_FILE="$DEFAULT_PUBKEY_FILE"
+MOCK_TIME=""
+
+usage() {
+    sed -n '3,/^set -euo pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
+    exit 1
+}
+
+SESSION_LOG=""
+log() {
+    local msg="[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"
+    echo "$msg" >&2
+    [[ -n "$SESSION_LOG" ]] && echo "$msg" >> "$SESSION_LOG"
+    return 0
+}
+
+# ---- porte: stesso approccio di mdtcap/mdtgps/mdtdiag ---------------------
+
+list_ports() {
+    echo "=== dmesg (ultime righe con ttyUSB) ==="
+    dmesg | grep -i ttyUSB || echo "(nessuna riga trovata, prova 'sudo dmesg' o ricollega il modulo)"
+    echo
+    echo "=== porte seriali presenti ==="
+    for p in /dev/ttyUSB*; do
+        [[ -e "$p" ]] || continue
+        info=$(udevadm info -q property -n "$p" 2>/dev/null | grep -E '^(ID_USB_INTERFACE_NUM|ID_MODEL|ID_VENDOR)=' | tr '\n' ' ')
+        echo "$p  $info"
+    done
+}
+
+probe_at_candidate() {
+    local dev="$1" fd resp="" line start_ts
+    stty -F "$dev" 115200 2>/dev/null || true
+    stty -F "$dev" raw -echo -echoe -echok time 0 min 0 2>/dev/null || return 1
+    exec {fd}<>"$dev" 2>/dev/null || return 1
+    printf 'AT\r' >&"$fd" 2>/dev/null
+    start_ts=$SECONDS
+    while IFS= read -r -t 2 -u "$fd" line 2>/dev/null; do
+        line="${line%$'\r'}"
+        [[ -z "$line" ]] && continue
+        resp+="$line"$'\n'
+        [[ "$line" == "OK" || "$line" == "ERROR" ]] && break
+        (( SECONDS - start_ts >= 3 )) && break
+    done
+    exec {fd}<&-
+    printf '%s' "$resp"
+}
+
+autodetect_at_port() {
+    local candidates=() p info resp
+    for p in /dev/ttyUSB*; do
+        [[ -e "$p" ]] || continue
+        info=$(udevadm info -q property -n "$p" 2>/dev/null) || info=""
+        if [[ -n "$AUTODETECT_VENDOR" ]]; then
+            echo "$info" | grep -qi "^ID_VENDOR=.*$AUTODETECT_VENDOR" || continue
+        fi
+        if [[ -n "$AUTODETECT_MODEL" ]]; then
+            echo "$info" | grep -qi "^ID_MODEL=.*$AUTODETECT_MODEL" || continue
+        fi
+        candidates+=("$p")
+    done
+    [[ ${#candidates[@]} -eq 0 ]] && { log "ATTENZIONE: --autodetect non ha trovato nessuna porta ttyUSB candidata."; return 1; }
+    for p in "${candidates[@]}"; do
+        resp=$(probe_at_candidate "$p") || resp=""
+        if echo "$resp" | grep -q '^OK$'; then
+            AT_PORT="$p"
+            log "Autodetect: porta AT trovata su $p"
+            return 0
+        fi
+    done
+    log "ATTENZIONE: --autodetect non ha trovato nessuna porta AT (nessuna candidata risponde OK ad 'AT')."
+    return 1
+}
+
+# Symlink stabile /dev/serial/by-id/... del device (sopravvive a un reset
+# del modulo anche se il numero ttyUSB cambia): usato per riconnettersi
+# dopo AT+CRESET.
+resolve_stable_path() {
+    local p="$1"
+    udevadm info -q property -n "$p" 2>/dev/null | sed -n 's/^DEVLINKS=//p' | tr ' ' '\n' | grep '/by-id/' | head -n1
+}
+
+# ---- pre-scan di mdt_configs/system.conf (solo --at-port/--autodetect) ----
+
+SYSTEM_FILE="$SCRIPT_DIR/mdt_configs/system.conf"
+if [[ -f "$SYSTEM_FILE" ]]; then
+    readarray -t SYSTEM_ARGS < <(
+        grep -v '^[[:space:]]*#' "$SYSTEM_FILE" | grep -v '^[[:space:]]*$' | xargs -n1 printf '%s\n'
+    )
+    set -- "${SYSTEM_ARGS[@]}" "$@"
+fi
+
+# ---- parsing argomenti ------------------------------------------------------
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --list-ports) list_ports; exit 0 ;;
+        --at-port) AT_PORT="$2"; shift 2 ;;
+        --baud) BAUD="$2"; shift 2 ;;
+        --autodetect) AUTODETECT=1; shift ;;
+        --autodetect-vendor) AUTODETECT_VENDOR="$2"; shift 2 ;;
+        --autodetect-model) AUTODETECT_MODEL="$2"; shift 2 ;;
+        --imei) NEW_IMEI="$2"; shift 2 ;;
+        --restore) RESTORE=1; shift ;;
+        --reset-wait) RESET_WAIT="$2"; shift 2 ;;
+        --yes) ASSUME_YES=1; shift ;;
+        --no-banner) BANNER_ENABLED=0; shift ;;
+        --auth-file) AUTH_FILE="$2"; shift 2 ;;
+        --pubkey) PUBKEY_FILE="$2"; shift 2 ;;
+        --mock-time) MOCK_TIME="$2"; shift 2 ;;
+        --diag-port|--qcsuper|--usb-modem-vid|--usb-modem-pid) shift 2 ;;  # da system.conf, non usati qui
+        -h|--help) usage ;;
+        *) echo "Argomento sconosciuto: $1" >&2; usage ;;
+    esac
+done
+
+if [[ "$RESTORE" -eq 1 ]]; then
+    [[ -z "$NEW_IMEI" ]] || { echo "--restore e --imei sono alternativi, non passarli insieme." >&2; exit 1; }
+    [[ -f "$IMEI_FILE" ]] || { echo "--restore richiesto ma $IMEI_FILE non esiste: nessun IMEI originale salvato da ripristinare. Specifica --imei esplicitamente." >&2; exit 1; }
+    NEW_IMEI=$(cat "$IMEI_FILE")
+    [[ "$NEW_IMEI" =~ ^[0-9]{15}$ ]] || { echo "$IMEI_FILE non contiene un IMEI di 15 cifre valido ('$NEW_IMEI')." >&2; exit 1; }
+fi
+
+[[ -n "$NEW_IMEI" ]] || { echo "Manca --imei (il nuovo IMEI di 15 cifre da impostare, richiede autorizzazione) oppure --restore (ripristina quello originale salvato in mdt_configs/imei, nessuna autorizzazione richiesta)." >&2; exit 1; }
+[[ "$NEW_IMEI" =~ ^[0-9]{15}$ ]] || { echo "--imei deve essere un IMEI di 15 cifre numeriche, ricevuto: '$NEW_IMEI'" >&2; exit 1; }
+
+[[ $EUID -eq 0 ]] || { echo "Esegui come root (serve accesso raw alla porta seriale AT)." >&2; exit 1; }
+
+require_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Comando richiesto non trovato: $1" >&2; exit 1; }; }
+require_cmd stty
+require_cmd udevadm
+require_cmd date
+if [[ "$RESTORE" -ne 1 ]]; then
+    [[ -x "$TESTAUTH_BIN" || -f "$TESTAUTH_BIN" ]] || { echo "src/testauth non trovato in $TESTAUTH_BIN (richiesto per autorizzare un nuovo IMEI, non per --restore)." >&2; exit 1; }
+    command -v python3 >/dev/null 2>&1 || { echo "Comando richiesto non trovato: python3 (per src/testauth)" >&2; exit 1; }
+    [[ -x "$MDTCONTRACT_BIN" || -f "$MDTCONTRACT_BIN" ]] || { echo "mdtcontract non trovato in $MDTCONTRACT_BIN (richiesto per calcolare il contractId)." >&2; exit 1; }
+fi
+
+mkdir -p "$LOG_DIR"
+SESSION_LOG="$LOG_DIR/mdtimei_$(date -u +%Y%m%d%H%M%S).log"
+
+if [[ "$BANNER_ENABLED" -eq 1 ]]; then
+    echo "mdtimei ver $SCRIPT_VERSION"
+    echo "(C) 2026 EPTO Tramaci"
+    echo
+fi
+
+cat >&2 <<'EOF'
+################################################################################
+#  ATTENZIONE: Usare solo in ambiente sperimentale, puo' essere illegale in  #
+#  alcuni paesi o comportare il ban della SIM.                               #
+################################################################################
+EOF
+[[ -n "$SESSION_LOG" ]] && cat >> "$SESSION_LOG" <<'EOF'
+ATTENZIONE: Usare solo in ambiente sperimentale, puo' essere illegale in
+alcuni paesi o comportare il ban della SIM.
+EOF
+
+log "Log di sessione: $SESSION_LOG"
+
+# ---- risoluzione porta AT --------------------------------------------------
+
+if [[ "$AUTODETECT" -eq 1 && -z "$AT_PORT" ]]; then
+    autodetect_at_port || true
+fi
+[[ -n "$AT_PORT" ]] || { echo "Manca --at-port (usa --list-ports o --autodetect per individuarla, oppure genera mdt_configs/system.conf con 'sudo ./install.sh --configure-system')." >&2; exit 1; }
+[[ -e "$AT_PORT" ]] || { echo "Porta AT inesistente: $AT_PORT" >&2; exit 1; }
+
+AT_PORT_STABLE=$(resolve_stable_path "$AT_PORT")
+if [[ -z "$AT_PORT_STABLE" ]]; then
+    log "ATTENZIONE: nessun symlink /dev/serial/by-id/ risolvibile per $AT_PORT, la riconnessione dopo AT+CRESET usera' lo stesso path (rischio di fallire se il device cambia numero ttyUSB)."
+    AT_PORT_STABLE="$AT_PORT"
+fi
+log "Porta AT: $AT_PORT (symlink stabile: $AT_PORT_STABLE)"
+
+# ---- apertura porta AT persistente -----------------------------------------
+
+open_at_port() {
+    local dev="$1"
+    stty -F "$dev" "$BAUD" 2>/dev/null || true
+    stty -F "$dev" raw -echo -echoe -echok time 0 min 0
+    exec {AT_FD}<>"$dev"
+}
+
+close_at_port() {
+    exec {AT_FD}<&-
+} 2>/dev/null
+# NB: redirect sulla DEFINIZIONE della funzione, non dentro il corpo —
+# cosi' vale solo per la durata di ogni chiamata. Un "exec ... 2>/dev/null"
+# dentro il corpo, senza comando, si applicherebbe in modo permanente a
+# tutta la shell da quel momento in poi (bug gia' preso e risolto in una
+# versione precedente di questa funzionalita').
+
+open_at_port "$AT_PORT"
+
+at_query() {
+    local cmd="$1" tmo="${2:-5}" resp="" line
+    printf '%s\r' "$cmd" >&"$AT_FD"
+    while IFS= read -r -t "$tmo" -u "$AT_FD" line; do
+        line="${line%$'\r'}"
+        [[ -z "$line" || "$line" == "$cmd" ]] && continue
+        resp+="$line"$'\n'
+        if [[ "$line" == "OK" || "$line" == "ERROR" || "$line" =~ ^\+CME\ ERROR ]]; then
+            break
+        fi
+    done
+    printf '%s' "$resp"
+}
+
+# ---- backup IMEI originale (stessa logica/stesso file di mdtcap) ----------
+
+ensure_imei_backup() {
+    [[ -f "$IMEI_FILE" ]] && return 0
+    local imei
+    imei=$(at_query "AT+CGSN" 5 | tr -d '\r' | grep -E '^[0-9]{14,16}$' | head -n1)
+    if [[ -n "$imei" ]]; then
+        mkdir -p "$(dirname "$IMEI_FILE")"
+        printf '%s\n' "$imei" > "$IMEI_FILE"
+        log "IMEI originale del modulo salvato in $IMEI_FILE ($imei): non esisteva ancora un backup."
+    else
+        log "ATTENZIONE: impossibile leggere l'IMEI (AT+CGSN) per salvarlo in $IMEI_FILE."
+    fi
+}
+
+# ---- attesa che il modulo torni a rispondere dopo AT+CRESET ---------------
+
+wait_module_back() {
+    # NB: dopo AT+CRESET puo' verificarsi una RI-ENUMERAZIONE USB IN DUE
+    # FASI (osservato empiricamente su questo modulo): il device ricompare
+    # per un istante sul vecchio ttyUSB, risponde persino "AT", per poi
+    # sparire di nuovo e riapparire per davvero (spesso con un numero
+    # ttyUSB diverso) qualche secondo dopo. Una singola risposta "OK" non
+    # basta quindi a considerare il modulo pronto: dopo il primo successo
+    # si riverifica, ri-risolvendo da capo il symlink stabile.
+    local timeout="$1" waited=0 real resp real2 resp2
+    close_at_port
+    log "Attesa che il modulo torni a rispondere dopo il reset (fino a ${timeout}s)..."
+    while true; do
+        if [[ -e "$AT_PORT_STABLE" ]]; then
+            real=$(readlink -f "$AT_PORT_STABLE" 2>/dev/null || true)
+            if [[ -n "$real" && -e "$real" ]] && resp=$(probe_at_candidate "$real") && echo "$resp" | grep -q '^OK$'; then
+                sleep 3
+                waited=$((waited + 3))
+                real2=$(readlink -f "$AT_PORT_STABLE" 2>/dev/null || true)
+                if [[ -n "$real2" && -e "$real2" ]] && resp2=$(probe_at_candidate "$real2") && echo "$resp2" | grep -q '^OK$'; then
+                    AT_PORT="$real2"
+                    open_at_port "$AT_PORT"
+                    log "Modulo di nuovo raggiungibile e stabile su $AT_PORT dopo ${waited}s."
+                    return 0
+                fi
+                log "Modulo raggiungibile ma non ancora stabile (probabile seconda fase di ri-enumerazione USB in corso), ritento..."
+            fi
+        fi
+        (( waited >= timeout )) && { log "ERRORE: il modulo non ha risposto in modo stabile entro ${timeout}s dopo il reset."; return 1; }
+        sleep 2
+        waited=$((waited + 2))
+    done
+}
+
+# ---- autorizzazione (solo --imei, MAI per --restore) -----------------------
+#
+# Legge l'ICCID della SIM attualmente inserita, calcola il DEVID
+# ("./mdtcontract --get-devid" — stessa identica risoluzione usata da
+# mdtcontract per il proprio contractId, non duplicata qui) e il
+# contractId (device + questa SIM, "./mdtcontract <ICCID>"), poi verifica
+# tutto con ./src/testauth. Aborta (senza aver ancora toccato AT+SIMEI)
+# se una qualunque di queste operazioni fallisce.
+run_authorization() {
+    local iccid_line iccid hwid contract auth_out auth_rc auth_value
+
+    iccid_line=$(at_query "AT+CCID" 5 | tr -d '\r' | grep -E '^\+I?CCID:' | head -n1)
+    iccid=$(echo "$iccid_line" | sed -E 's/^\+I?CCID:[[:space:]]*//')
+    if [[ -z "$iccid" ]]; then
+        close_at_port
+        echo "ABORT: impossibile leggere l'ICCID (AT+CCID) — la SIM deve essere inserita per autorizzare un nuovo IMEI (il ripristino con --restore non la richiede)." >&2
+        exit 2
+    fi
+    log "ICCID rilevato: $iccid"
+
+    if ! hwid=$("$MDTCONTRACT_BIN" --get-devid 2>>"$SESSION_LOG"); then
+        close_at_port
+        echo "ABORT: mdtcontract --get-devid non e' riuscito a determinare il DEVID di questa macchina (vedi $SESSION_LOG)." >&2
+        exit 2
+    fi
+    log "DEVID: $hwid"
+
+    if ! contract=$("$MDTCONTRACT_BIN" "$iccid" 2>>"$SESSION_LOG"); then
+        close_at_port
+        echo "ABORT: mdtcontract non e' riuscito a calcolare il contractId (vedi $SESSION_LOG)." >&2
+        exit 2
+    fi
+    log "CONTRACT (contractId): $contract"
+
+    local mock_args=()
+    [[ -n "$MOCK_TIME" ]] && mock_args=(--mock-time "$MOCK_TIME")
+
+    local stderr_tmp
+    stderr_tmp=$(mktemp)
+    auth_rc=0
+    auth_out=$("$TESTAUTH_BIN" \
+        --auth-file "$AUTH_FILE" --pubkey "$PUBKEY_FILE" \
+        --DEVID "$hwid" --ICCID "$iccid" --IMEI "$NEW_IMEI" --CONTRACT "$contract" \
+        "${mock_args[@]}" 2>"$stderr_tmp") || auth_rc=$?
+    local auth_err
+    auth_err=$(cat "$stderr_tmp" 2>/dev/null)
+    rm -f "$stderr_tmp"
+    [[ -n "$auth_err" ]] && log "src/testauth: $auth_err"
+
+    if [[ "$auth_rc" -eq 77 ]]; then
+        close_at_port
+        log "MODALITA' TEST (--mock-time $MOCK_TIME): src/testauth ha risposto exit 77."
+        if [[ -n "$auth_out" ]]; then
+            log "Con questa data finta l'autorizzazione SAREBBE CONCESSA (AUTH: $auth_out)."
+        else
+            log "Con questa data finta l'autorizzazione SAREBBE NEGATA: $auth_err"
+        fi
+        log "--mock-time non arriva MAI a toccare AT+SIMEI/AT+CRESET: nessuna modifica effettuata. Rilancia senza --mock-time per una verifica/modifica vera."
+        exit 0
+    fi
+    if [[ "$auth_rc" -ne 0 ]]; then
+        close_at_port
+        echo "ABORT: autorizzazione NEGATA per l'IMEI $NEW_IMEI (DEVID=$hwid ICCID=$iccid CONTRACT=$contract): $auth_err" >&2
+        exit 3
+    fi
+
+    auth_value="$auth_out"
+    log "Autorizzazione CONCESSA per l'IMEI $NEW_IMEI (AUTH: $auth_value)."
+    AUTH_VALUE="$auth_value"
+    ICCID_VALUE="$iccid"
+    HWID_VALUE="$hwid"
+    CONTRACT_VALUE="$contract"
+}
+
+# ---- backup + riepilogo + conferma / autorizzazione ------------------------
+
+ensure_imei_backup
+CURRENT_IMEI=""
+check=$(at_query "AT+SIMEI?" 5 | tr -d '\r' | grep '^+SIMEI:' || true)
+CURRENT_IMEI="${check#+SIMEI:}"
+CURRENT_IMEI="${CURRENT_IMEI// /}"
+
+AUTH_VALUE=""
+ICCID_VALUE=""
+HWID_VALUE=""
+CONTRACT_VALUE=""
+if [[ "$RESTORE" -ne 1 ]]; then
+    run_authorization
+fi
+
+echo >&2
+echo "Riepilogo prima di procedere:" >&2
+echo "  Modalita'      : $( [[ "$RESTORE" -eq 1 ]] && echo "ripristino (--restore, nessuna autorizzazione richiesta)" || echo "impostazione nuovo IMEI (autorizzato)" )" >&2
+echo "  Porta AT       : $AT_PORT" >&2
+echo "  IMEI attuale   : ${CURRENT_IMEI:-sconosciuto}" >&2
+echo "  IMEI da impostare: $NEW_IMEI" >&2
+[[ -f "$IMEI_FILE" ]] && echo "  IMEI originale (backup): $(cat "$IMEI_FILE") — in $IMEI_FILE" >&2
+if [[ "$RESTORE" -ne 1 ]]; then
+    echo "  DEVID/ICCID/CONTRACT: $HWID_VALUE / $ICCID_VALUE / $CONTRACT_VALUE" >&2
+    echo "  Autorizzazione (AUTH): $AUTH_VALUE" >&2
+fi
+echo >&2
+
+if [[ "$RESTORE" -eq 1 ]]; then
+    if [[ "$ASSUME_YES" -ne 1 ]]; then
+        read -r -p "Scrivi CONFERMO per procedere: " confirm
+        if [[ "$confirm" != "CONFERMO" ]]; then
+            close_at_port
+            echo "Annullato dall'utente." >&2
+            exit 1
+        fi
+    fi
+else
+    # Passo fisico non scriptabile via CONFERMO: la SIM appena verificata
+    # sopra (ICCID/CONTRACT) non deve restare nel modulo mentre gli si
+    # cambia l'IMEI, per non avere mai, nella stessa sessione, sia una SIM
+    # live sia un IMEI appena cambiato — vedi commento in testa al file.
+    if [[ "$ASSUME_YES" -ne 1 ]]; then
+        read -r -p "Autorizzazione concessa. Rimuovi FISICAMENTE la SIM dal modulo, poi premi invio per procedere: " _
+        recheck=$(at_query "AT+CCID" 5 | tr -d '\r' | grep -E '^\+I?CCID:' || true)
+        if [[ -n "$recheck" ]]; then
+            log "ATTENZIONE: il modulo risponde ancora a AT+CCID dopo la richiesta di rimozione (\"$recheck\") — puo' essere uno stato residuo non ancora aggiornato dal modulo, o la SIM non e' stata rimossa davvero. Procedo comunque (nessun blocco automatico), verificare a vista."
+        fi
+    else
+        log "ATTENZIONE: --yes ha saltato il passo di rimozione fisica della SIM (uso scriptato) — verificare a mano che la SIM non sia rimasta inserita."
+    fi
+fi
+
+# ---- imposta il nuovo IMEI e riavvia ---------------------------------------
+
+res=$(at_query "AT+SIMEI=$NEW_IMEI" 5)
+echo "$res" | grep -q '^OK$' || { close_at_port; echo "ABORT: AT+SIMEI=$NEW_IMEI non ha risposto OK: $(echo "$res" | tr '\n' ' ')" >&2; exit 5; }
+log "IMEI impostato a $NEW_IMEI (AT+SIMEI)."
+
+at_query "AT+CRESET" 5 >/dev/null || true
+log "AT+CRESET inviato per rendere effettivo il nuovo IMEI."
+if ! wait_module_back "$RESET_WAIT"; then
+    echo "ABORT: modulo irraggiungibile dopo il riavvio. Verifica manualmente (AT+SIMEI?) lo stato — l'IMEI potrebbe gia' essere $NEW_IMEI anche se il modulo non e' ancora raggiungibile." >&2
+    exit 6
+fi
+
+check=$(at_query "AT+SIMEI?" 5 | tr -d '\r' | grep '^+SIMEI:' || true)
+if echo "$check" | grep -q "$NEW_IMEI"; then
+    log "Fatto: modulo riavviato, IMEI confermato ($check)."
+else
+    log "ERRORE: dopo il riavvio AT+SIMEI? riporta '$check', atteso $NEW_IMEI. Verificare manualmente."
+    close_at_port
+    exit 7
+fi
+
+close_at_port
+log "Completato. Log completo: $SESSION_LOG"
+exit 0

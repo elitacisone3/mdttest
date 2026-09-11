@@ -1,0 +1,475 @@
+#!/usr/bin/env bash
+#
+# mdtdiag
+#
+# Diagnostica rapida e in SOLA LETTURA del modem Qualcomm-based (es.
+# SIM7600E-H) usato da mdtcap: stato SIM/PIN, segnale, registrazione di
+# rete, cella servente, contesto dati e (opzionale) stato GPS/GNSS.
+# Pensato come check pre-volo prima di lanciare una cattura mdtcap lunga,
+# o come diagnosi rapida quando una cattura fallisce (es. --require-lte
+# che abortisce, PIN rifiutato, nessun attach dati).
+#
+# Script indipendente: non modifica ne' richiama mdtcap. Duplica
+# volutamente la piccola quantita' di logica di autodetect/AT condivisa
+# (stesso algoritmo di ricerca porta, stesso stile di log) per restare
+# un singolo file autonomo, senza dipendenze da mdtcap.
+#
+# Licenza: GNU General Public License v3.0 (GPLv3) — vedi LICENSE.
+# Autore:  EPTO Tramaci
+#
+# Uso:
+#   sudo ./mdtdiag --list-ports
+#   sudo ./mdtdiag --at-port /dev/ttyUSB2 [--baud 115200] [--gps]
+#       [--watch SECONDS] [--csv FILE] [--out FILE] [--no-banner]
+#   sudo ./mdtdiag --autodetect [--autodetect-vendor STRINGA]
+#       [--autodetect-model STRINGA] [--gps] [--watch SECONDS] [--csv FILE]
+#   sudo ./mdtdiag (--at-port DEV | --autodetect) --get-sim
+#
+# --get-sim: uscita minimale pensata per il consumo da altri script (es.
+#   mdtcontract --get-sim-user, vedi mdtcontract --help): stampa SOLO una
+#   riga "ICCID:<iccid>" (AT+CCID, con ripiego su AT+ICCID) su stdout,
+#   senza banner ne' nessun altro output — implica --no-banner. Exit 0
+#   con la riga stampata se la lettura riesce; exit 1 senza nulla su
+#   stdout (solo un messaggio d'errore su stderr) se la SIM e'
+#   bloccata/assente o non risponde. Ignora --gps/--gps-activate/--watch/
+#   --csv/--out (non ha senso alcun "giro" ripetuto per un singolo
+#   valore).
+#
+# --autodetect: individua da sola la porta AT tra i device /dev/ttyUSB*
+#   presenti (stesso algoritmo di mdtcap --autodetect: prova "AT" su ogni
+#   candidata filtrata per vendor/modello, default vendor "SimTech", usa
+#   la prima che risponde OK). A differenza di mdtcap non serve la porta
+#   Diag: mdtdiag non fa nessuna cattura, solo query AT.
+#
+# SICUREZZA / GARANZIA DI SOLA LETTURA: mdtdiag non invia MAI AT+CPIN=
+# (nessun tentativo di sblocco PIN/PUK), AT+CFUN= o AT+CNMP= (nessun
+# ciclo radio o forzatura RAT), AT+CGDCONT= in scrittura (nessuna
+# modifica APN), ne' AT+CGACT=/AT+CGATT= in scrittura (nessun
+# attach/detach dati). L'unica eccezione, esplicita e disattivata di
+# default, e' --gps-activate (vedi sotto): tutto il resto sono comandi
+# AT di sola interrogazione (terminano in '?' o sono query native, es.
+# AT+CSQ/AT+CCID/AT+CGSN). Uso ripetuto e continuo (--watch) e' quindi
+# sicuro per la SIM quanto una singola esecuzione.
+#
+# --gps: aggiunge lo stato GPS/GNSS (AT+CGPS? — se il modulo GPS e' gia'
+#   attivo — e AT+CGPSINFO per un eventuale fix) al blocco diagnostico.
+#   Query pura: se il GPS del modulo e' spento non lo accende, riporta
+#   solo che risulta spento.
+#
+# --gps-activate: come --gps, ma se il GPS risulta spento lo accende con
+#   AT+CGPS=1 prima di interrogare (unica azione non passiva di questo
+#   script — usarlo consapevolmente). Non lo rispegne al termine (stesso
+#   comportamento non invasivo di mdtcap --gps-wait).
+#
+# --watch SECONDS: ripete il blocco di stato (non la parte statica
+#   identita' modulo/SIM) ogni SECONDS secondi finche' non si preme
+#   Ctrl+C, con timestamp UTC ad ogni giro. Senza --watch, esecuzione
+#   singola.
+#
+# --csv FILE: in modalita' --watch (ignorato senza), appende anche una
+#   riga CSV per ogni giro (timestamp, stato_sim, tipo_rete, operatore,
+#   creg, cereg, rssi, ber, gps_fix) — utile per un log leggero parallelo
+#   a una cattura mdtcap lunga, o per grafici successivi.
+#
+# --out FILE: oltre a stdout, salva anche uno snapshot testuale completo
+#   (stesso contenuto stampato a schermo) in FILE. In modalita' --watch
+#   viene scritto/aggiornato ad ogni giro (contiene solo l'ultimo giro,
+#   non uno storico — per lo storico usare --csv).
+#
+# --baud RATE: baud rate "best effort" per la porta AT (default 115200,
+#   vedi nota in mdtcap: su queste porte seriali USB e' solo informativo).
+#
+# --no-banner: disabilita l'intestazione iniziale ("mdtdiag ver ...").
+#
+# mdt_configs/system.conf: se presente (relativo alla posizione di questo
+#   script), viene caricato automaticamente ad ogni esecuzione — stesso
+#   file di sistema usato da mdtcap (porta o --autodetect, --qcsuper),
+#   generato/aggiornato da "sudo ./install.sh --configure-system". Solo
+#   --at-port/--autodetect/--autodetect-vendor/--autodetect-model/--baud
+#   hanno un effetto qui (mdtdiag non fa cattura, non serve la porta
+#   Diag): --diag-port/--qcsuper, se presenti nel file, vengono accettati
+#   ma ignorati, cosi' lo stesso system.conf resta riusabile cosi' com'e'
+#   fra mdtcap/mdtdiag/mdtgps. Qualunque valore passato esplicitamente
+#   sulla riga di comando vince sempre su questo file.
+
+set -euo pipefail
+
+SCRIPT_VERSION="1.0"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+
+AT_PORT=""
+BAUD=115200
+AUTODETECT=0
+AUTODETECT_VENDOR="SimTech"
+AUTODETECT_MODEL=""
+GPS_ENABLED=0
+GPS_ACTIVATE=0
+WATCH_INTERVAL=0
+CSV_FILE=""
+OUT_FILE=""
+BANNER_ENABLED=1
+GET_SIM=0
+
+usage() {
+    # Range dinamico (non un numero di riga fisso): si ferma da solo
+    # prima di "set -euo pipefail", non va aggiornato manualmente ogni
+    # volta che questo blocco di commenti cambia lunghezza (stesso
+    # accorgimento usato in mdtcap).
+    sed -n '3,/^set -euo pipefail/p' "$0" | sed '$d' | grep '^#' | sed 's/^# \{0,1\}//'
+    exit 1
+}
+
+log() {
+    local msg="[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"
+    echo "$msg" >&2
+}
+
+# ---- porte: stesso approccio di mdtcap (dmesg + udevadm) --------------
+
+list_ports() {
+    echo "=== dmesg (ultime righe con ttyUSB) ==="
+    dmesg | grep -i ttyUSB || echo "(nessuna riga trovata, prova 'sudo dmesg' o ricollega il modulo)"
+    echo
+    echo "=== porte seriali presenti ==="
+    for p in /dev/ttyUSB*; do
+        [[ -e "$p" ]] || continue
+        info=$(udevadm info -q property -n "$p" 2>/dev/null | grep -E '^(ID_USB_INTERFACE_NUM|ID_MODEL|ID_VENDOR)=' | tr '\n' ' ')
+        echo "$p  $info"
+    done
+    echo
+    echo "Individua una porta AT inviando 'AT' (deve rispondere OK), oppure usa --autodetect."
+}
+
+# Prova "AT" su un candidato, senza toccare lo stato globale (identico
+# nello spirito a probe_at_candidate() di mdtcap).
+probe_at_candidate() {
+    local dev="$1" fd resp="" line start_ts
+    stty -F "$dev" 115200 2>/dev/null || true
+    stty -F "$dev" raw -echo -echoe -echok time 0 min 0 2>/dev/null || return 1
+    exec {fd}<>"$dev" 2>/dev/null || return 1
+    printf 'AT\r' >&"$fd" 2>/dev/null
+    start_ts=$SECONDS
+    while IFS= read -r -t 2 -u "$fd" line 2>/dev/null; do
+        line="${line//$'\r'/}"  # rimuove OGNI \r, non solo l'ultimo: il modem
+                                 # a volte concatena l'echo del comando (ATE1)
+                                 # e l'inizio della risposta nella stessa riga
+                                 # letta da 'read' (delimitata solo da \n),
+                                 # con piu' di un \r consecutivo (es. "AT+CGMI\r\r")
+        [[ -z "$line" ]] && continue
+        resp+="$line"$'\n'
+        [[ "$line" == "OK" || "$line" == "ERROR" ]] && break
+        (( SECONDS - start_ts >= 3 )) && break
+    done
+    exec {fd}<&-
+    printf '%s' "$resp"
+}
+
+autodetect_at_port() {
+    local candidates=() p info resp
+
+    for p in /dev/ttyUSB*; do
+        [[ -e "$p" ]] || continue
+        info=$(udevadm info -q property -n "$p" 2>/dev/null) || info=""
+        if [[ -n "$AUTODETECT_VENDOR" ]]; then
+            echo "$info" | grep -qi "^ID_VENDOR=.*$AUTODETECT_VENDOR" || continue
+        fi
+        if [[ -n "$AUTODETECT_MODEL" ]]; then
+            echo "$info" | grep -qi "^ID_MODEL=.*$AUTODETECT_MODEL" || continue
+        fi
+        candidates+=("$p")
+    done
+
+    if [[ ${#candidates[@]} -eq 0 ]]; then
+        log "ATTENZIONE: --autodetect non ha trovato nessuna porta ttyUSB corrispondente (vendor='${AUTODETECT_VENDOR:-qualsiasi}', modello='${AUTODETECT_MODEL:-qualsiasi}')."
+        return 1
+    fi
+    log "Autodetect: ${#candidates[@]} porta/e candidate: ${candidates[*]}"
+
+    for p in "${candidates[@]}"; do
+        resp=$(probe_at_candidate "$p") || resp=""
+        if echo "$resp" | grep -q '^OK$'; then
+            AT_PORT="$p"
+            log "Autodetect: porta AT trovata su $p"
+            return 0
+        fi
+    done
+    log "ATTENZIONE: --autodetect non ha trovato nessuna porta AT (nessuna candidata risponde OK ad 'AT')."
+    return 1
+}
+
+# ---- pre-scan di mdt_configs/system.conf: espande in argomenti --------
+#
+# Stesso file di sistema (porta o --autodetect, --qcsuper) usato da
+# mdtcap: caricato automaticamente se presente (silenziosamente ignorato
+# se assente), con la precedenza piu' bassa possibile - qualunque
+# argomento reale sulla riga di comando vince sempre su questo file. Solo
+# --at-port/--autodetect/--autodetect-vendor/--autodetect-model/--baud
+# hanno un effetto qui (mdtdiag non fa capture, non serve mai la porta
+# Diag): --diag-port/--qcsuper, se presenti nel file (di norma lo sono,
+# essendo lo stesso system.conf di mdtcap), vengono accettati ma ignorati
+# (vedi sotto), cosi' lo stesso file resta riusabile senza modifiche fra
+# i vari script del progetto.
+SYSTEM_FILE="$SCRIPT_DIR/mdt_configs/system.conf"
+if [[ -f "$SYSTEM_FILE" ]]; then
+    readarray -t SYSTEM_ARGS < <(
+        grep -v '^[[:space:]]*#' "$SYSTEM_FILE" | grep -v '^[[:space:]]*$' | xargs -n1 printf '%s\n'
+    )
+    set -- "${SYSTEM_ARGS[@]}" "$@"
+fi
+
+# ---- parsing argomenti --------------------------------------------------
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --list-ports) list_ports; exit 0 ;;
+        --at-port) AT_PORT="$2"; shift 2 ;;
+        --baud) BAUD="$2"; shift 2 ;;
+        --autodetect) AUTODETECT=1; shift ;;
+        --autodetect-vendor) AUTODETECT_VENDOR="$2"; shift 2 ;;
+        --autodetect-model) AUTODETECT_MODEL="$2"; shift 2 ;;
+        --gps) GPS_ENABLED=1; shift ;;
+        --gps-activate) GPS_ENABLED=1; GPS_ACTIVATE=1; shift ;;
+        --watch) WATCH_INTERVAL="$2"; shift 2 ;;
+        --csv) CSV_FILE="$2"; shift 2 ;;
+        --out) OUT_FILE="$2"; shift 2 ;;
+        --get-sim) GET_SIM=1; shift ;;
+        --no-banner) BANNER_ENABLED=0; shift ;;
+        --diag-port|--qcsuper|--usb-modem-vid|--usb-modem-pid) shift 2 ;;  # da system.conf, non usati qui (nessuna cattura)
+        -h|--help) usage ;;
+        *) echo "Argomento sconosciuto: $1" >&2; usage ;;
+    esac
+done
+
+[[ $EUID -eq 0 ]] || { echo "Esegui come root (serve accesso raw alla porta seriale AT)." >&2; exit 1; }
+
+# --get-sim: uscita minimale per consumo da altri script (mdtcontract
+# --get-sim-user) — implica --no-banner, nessun'altra riga oltre
+# all'ICCID stesso deve comparire su stdout.
+[[ "$GET_SIM" -eq 1 ]] && BANNER_ENABLED=0
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || { echo "Comando richiesto non trovato: $1" >&2; exit 1; }
+}
+require_cmd stty
+require_cmd date
+
+if [[ "$BANNER_ENABLED" -eq 1 ]]; then
+    echo "mdtdiag ver $SCRIPT_VERSION — diagnostica di sola lettura (nessun PIN/PUK/APN/CFUN inviato)"
+    echo "(C) 2026 EPTO Tramaci"
+    echo
+fi
+
+if [[ "$AUTODETECT" -eq 1 && -z "$AT_PORT" ]]; then
+    autodetect_at_port || true
+fi
+
+[[ -n "$AT_PORT" ]] || { echo "Manca --at-port (usa --list-ports o --autodetect per individuarla)." >&2; exit 1; }
+[[ -e "$AT_PORT" ]] || { echo "Porta AT inesistente: $AT_PORT" >&2; exit 1; }
+
+# ---- apertura porta AT persistente (stesso approccio di mdtcap) --------
+
+stty -F "$AT_PORT" "$BAUD" 2>/dev/null || true
+stty -F "$AT_PORT" raw -echo -echoe -echok time 0 min 0
+exec {AT_FD}<>"$AT_PORT"
+
+at_query() {
+    local cmd="$1" tmo="${2:-3}" resp="" line
+    printf '%s\r' "$cmd" >&"$AT_FD"
+    while IFS= read -r -t "$tmo" -u "$AT_FD" line; do
+        line="${line//$'\r'/}"  # rimuove OGNI \r, non solo l'ultimo: il modem
+                                 # a volte concatena l'echo del comando (ATE1)
+                                 # e l'inizio della risposta nella stessa riga
+                                 # letta da 'read' (delimitata solo da \n),
+                                 # con piu' di un \r consecutivo (es. "AT+CGMI\r\r")
+        [[ -z "$line" ]] && continue
+        # Il modem ha di norma l'echo del comando attivo (ATE1, default di
+        # fabbrica): la prima riga ricevuta e' spesso il comando stesso
+        # ("AT+CGMI"), non la risposta. Scartarla per non farla passare
+        # come valore da extract_field (rilevante soprattutto per le
+        # risposte senza prefisso, es. AT+CGMI/CGMM/CGMR/CGSN).
+        [[ "$line" == "$cmd" ]] && continue
+        resp+="$line"$'\n'
+        if [[ "$line" == "OK" || "$line" == "ERROR" || "$line" =~ ^\+CME\ ERROR ]]; then
+            break
+        fi
+    done
+    printf '%s' "$resp"
+}
+
+# Estrae il valore della prima riga utile (non vuota, non OK/ERROR) che
+# inizia col prefisso dato (es. extract_field "$resp" '+CSQ:' -> "30,99");
+# con prefisso vuoto restituisce semplicemente quella riga cosi' com'e'
+# (usato per risposte senza prefisso, es. AT+CGMI/CGMM/CGMR/CGSN).
+# Match letterale (bash pattern, non regex): un prefisso con caratteri
+# come '+' o '?' (es. "+CSQ:") non deve essere interpretato come regex.
+extract_field() {
+    local text="$1" prefix="$2" line
+    while IFS= read -r line; do
+        line="${line//$'\r'/}"  # rimuove OGNI \r, non solo l'ultimo: il modem
+                                 # a volte concatena l'echo del comando (ATE1)
+                                 # e l'inizio della risposta nella stessa riga
+                                 # letta da 'read' (delimitata solo da \n),
+                                 # con piu' di un \r consecutivo (es. "AT+CGMI\r\r")
+        [[ -z "$line" || "$line" == "OK" || "$line" == "ERROR" ]] && continue
+        if [[ -z "$prefix" ]]; then
+            printf '%s' "$line"
+            return 0
+        fi
+        if [[ "$line" == "$prefix"* ]]; then
+            line="${line#"$prefix"}"
+            while [[ "$line" == " "* ]]; do line="${line# }"; done
+            printf '%s' "$line"
+            return 0
+        fi
+    done <<< "$text"
+    printf ''
+}
+
+# --get-sim: unica riga "ICCID:<valore>" su stdout, poi esce subito —
+# non raggiunge mai print_identity()/print_status() ne' --watch/--csv/
+# --out (ignorati, vedi commento --get-sim in testa allo script). Il
+# prefisso "ICCID:" (invece del solo valore nudo) e' pensato per essere
+# consumato direttamente da mdtcontract --get-sim-user (che lo rilancia
+# tale e quale come prima delle sue due righe di output, aggiungendo poi
+# "CONTRACT:<contractId>" — vedi mdtcontract --help).
+if [[ "$GET_SIM" -eq 1 ]]; then
+    iccid=$(extract_field "$(at_query 'AT+CCID')" '+CCID:')
+    [[ -n "$iccid" ]] || iccid=$(extract_field "$(at_query 'AT+ICCID')" '+ICCID:')
+    if [[ -n "$iccid" ]]; then
+        printf 'ICCID:%s\n' "$iccid"
+        exit 0
+    else
+        echo "ICCID non disponibile (SIM bloccata o non inserita, o nessuna risposta dal modem)." >&2
+        exit 1
+    fi
+fi
+
+# ---- blocco identita' modulo/SIM (statico, una volta sola) -------------
+
+print_identity() {
+    local vendor model fw imei iccid imsi
+    vendor=$(extract_field "$(at_query 'AT+CGMI')" '')
+    model=$(extract_field "$(at_query 'AT+CGMM')" '')
+    local cgmr_resp; cgmr_resp=$(at_query 'AT+CGMR')
+    fw=$(extract_field "$cgmr_resp" '+CGMR:')
+    [[ -n "$fw" ]] || fw=$(extract_field "$cgmr_resp" '')
+    imei=$(extract_field "$(at_query 'AT+CGSN')" '')
+    iccid=$(extract_field "$(at_query 'AT+CCID')" '+CCID:')
+    [[ -n "$iccid" ]] || iccid=$(extract_field "$(at_query 'AT+ICCID')" '+ICCID:')
+    imsi=$(at_query 'AT+CIMI' | tr -d '\r' | { grep -E '^[0-9]{5,}$' || true; } | head -1)
+
+    echo "=== Identita' modulo/SIM ==="
+    echo "Modulo   : ${vendor:-?} ${model:-?} (fw ${fw:-?})"
+    echo "IMEI     : ${imei:-?}"
+    echo "ICCID    : ${iccid:-non disponibile (SIM bloccata o non inserita)}"
+    echo "IMSI     : ${imsi:-non disponibile (SIM bloccata o non inserita)}"
+    echo
+}
+
+# ---- blocco di stato (ripetuto ad ogni giro in --watch) ----------------
+
+print_status() {
+    local pin_raw pin_state csq_raw rssi ber creg_raw creg cereg_raw cereg
+    local cops_raw operator cpsi_raw net_mode cgdcont_raw apn cgatt_raw attach ip_raw ip
+    local gps_state_raw gps_state gps_info lat
+
+    pin_raw=$(at_query 'AT+CPIN?' 5 | tr -d '\r')
+    pin_state=$(extract_field "$pin_raw" '+CPIN:')
+    if echo "$pin_raw" | grep -q 'CME ERROR'; then
+        pin_state=$(echo "$pin_raw" | grep -m1 'CME ERROR' || true)
+    fi
+    [[ -n "$pin_state" ]] || pin_state="sconosciuto (nessuna risposta)"
+
+    csq_raw=$(extract_field "$(at_query 'AT+CSQ')" '+CSQ:')
+    rssi="${csq_raw%%,*}"
+    ber="${csq_raw##*,}"
+
+    creg_raw=$(extract_field "$(at_query 'AT+CREG?')" '+CREG:')
+    creg="${creg_raw##*,}"
+    cereg_raw=$(extract_field "$(at_query 'AT+CEREG?')" '+CEREG:')
+    cereg="${cereg_raw##*,}"
+
+    cops_raw=$(extract_field "$(at_query 'AT+COPS?')" '+COPS:')
+    operator=$(echo "$cops_raw" | awk -F',' '{gsub(/"/,"",$3); print $3}')
+
+    cpsi_raw=$(extract_field "$(at_query 'AT+CPSI?' 5)" '+CPSI:')
+    net_mode="${cpsi_raw%%,*}"
+
+    cgdcont_raw=$(at_query 'AT+CGDCONT?' | tr -d '\r' | { grep -m1 '^+CGDCONT: 1,' || true; })
+    apn=$(echo "$cgdcont_raw" | awk -F',' '{gsub(/"/,"",$3); print $3}')
+
+    cgatt_raw=$(extract_field "$(at_query 'AT+CGATT?')" '+CGATT:')
+    case "$cgatt_raw" in
+        1) attach="attaccato" ;;
+        0) attach="non attaccato" ;;
+        *) attach="sconosciuto" ;;
+    esac
+
+    ip_raw=$(at_query 'AT+CGPADDR=1' | tr -d '\r' | { grep -m1 '^+CGPADDR:' || true; })
+    ip=$(echo "$ip_raw" | awk -F',' '{print $2}')
+
+    echo "--- $(date -u +%Y-%m-%dT%H:%M:%SZ) ---"
+    echo "SIM/PIN     : $pin_state"
+    echo "Segnale     : RSSI=${rssi:-?}/31, BER=${ber:-?} (AT+CSQ)"
+    echo "Reg. 2G/3G  : CREG=${creg:-?} (0/1=non serve;1/5=registrata;2=in ricerca;3=negata)"
+    echo "Reg. LTE    : CEREG=${cereg:-?}"
+    echo "Operatore   : ${operator:-nessuno (AT+COPS?)}"
+    echo "Cella       : ${net_mode:-sconosciuto} (AT+CPSI?: ${cpsi_raw:-nessuna risposta})"
+    echo "APN (ctx 1) : ${apn:-non impostato}"
+    echo "Attach dati : $attach${ip:+, IP=$ip}"
+
+    gps_fix_summary="n/d"
+    if [[ "$GPS_ENABLED" -eq 1 ]]; then
+        gps_state_raw=$(extract_field "$(at_query 'AT+CGPS?')" '+CGPS:')
+        gps_state="${gps_state_raw%%,*}"
+        if [[ "$GPS_ACTIVATE" -eq 1 && "$gps_state" != "1" ]]; then
+            log "GPS risulta spento e --gps-activate richiesto: invio AT+CGPS=1 (unica azione non passiva di mdtdiag)"
+            at_query 'AT+CGPS=1' 5 >/dev/null
+            sleep 2
+            gps_state_raw=$(extract_field "$(at_query 'AT+CGPS?')" '+CGPS:')
+            gps_state="${gps_state_raw%%,*}"
+        fi
+        gps_info=$(extract_field "$(at_query 'AT+CGPSINFO' 5)" '+CGPSINFO:')
+        lat=$(echo "$gps_info" | cut -d',' -f1)
+        if [[ -n "$lat" ]]; then
+            gps_fix_summary="fix: $gps_info"
+        else
+            gps_fix_summary="nessun fix (GPS $( [[ "$gps_state" == "1" ]] && echo attivo || echo spento ))"
+        fi
+        echo "GPS/GNSS    : $gps_fix_summary"
+    fi
+    echo
+
+    if [[ -n "$CSV_FILE" ]]; then
+        if [[ ! -s "$CSV_FILE" ]]; then
+            echo "timestamp_utc,sim_pin,rssi,ber,creg,cereg,operatore,cella,apn,attach_dati,ip,gps" > "$CSV_FILE"
+        fi
+        printf '%s,"%s",%s,%s,%s,%s,"%s","%s","%s","%s","%s","%s"\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$pin_state" "${rssi:-}" "${ber:-}" "${creg:-}" "${cereg:-}" \
+            "${operator:-}" "${net_mode:-}" "${apn:-}" "$attach" "${ip:-}" "$gps_fix_summary" >> "$CSV_FILE"
+    fi
+}
+
+run_once() {
+    if [[ -n "$OUT_FILE" ]]; then
+        { print_identity; print_status; } | tee "$OUT_FILE"
+    else
+        print_identity
+        print_status
+    fi
+}
+
+if [[ "$WATCH_INTERVAL" -gt 0 ]]; then
+    print_identity
+    log "Modalita' --watch: un giro ogni ${WATCH_INTERVAL}s, Ctrl+C per fermare."
+    while true; do
+        if [[ -n "$OUT_FILE" ]]; then
+            print_status | tee "$OUT_FILE"
+        else
+            print_status
+        fi
+        sleep "$WATCH_INTERVAL"
+    done
+else
+    run_once
+fi

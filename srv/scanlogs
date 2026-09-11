@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+"""
+Estrae, da UNA directory di evidenza gia' prodotta da mdtcap, un ndjson
+(una riga per evento) pensato per un'analisi aggregata lato server
+(per dispositivo/cella/tempo) — indipendente dall'archivio
+.tar.gz.gpg probatorio (vedi src/mdtmain_lib/evidence.py), che resta
+invariato: questo e' un SECONDO canale, parallelo.
+
+Uso: scanlogs <evidence_dir>
+
+Se l'evidenza indicata non contiene nulla di rilevante (vedi
+has_any_evidence sotto), non stampa nulla ed esce con codice 0 — questo
+e' il caso "normale" della maggior parte dei test. Un ndjson non vuoto
+viene stampato su stdout, una riga JSON per evento, MAI altro rumore su
+stdout (stesso contratto di src/extra_scan/src/mdt_bitscan.py).
+
+Tipi di evidenza generati (vedi tabella di mappatura nel piano di
+implementazione):
+    MDT      richiesta esplicita di invio misure (logMeasReportReq)
+    MDT_A    configurazione/richiesta di attivazione MDT/GPS
+    RRC      risposta RRC con posizione (da coordinate_estratte.csv)
+    DIAG     riga aggregata unica se la somma dei 5 contatori di
+             warning (diagWarn/warnPosD/warnPosL/warnMDTD/warnMDTL) e'
+             maggiore di zero — nessun dato per-frame disponibile,
+             dmp sempre null
+    <categoria extra_scan>  SMSSTK/NASId/RRCCiph/cellSys/GPSLoc/WCDMA3G,
+             una riga per evento di livello W/C/A (I e' scartato: vedi
+             _EXTRA_LEVELS_EMITTED) trovato in extra_scan_<CAT>.log
+
+Filosofia errori (vedi anche i commenti su has_any_evidence/main):
+fatale (exit non-zero, nessun output) SOLO per: directory inesistente,
+manifest.json mancante/JSON non valido, "mdtcontract --get-devid"
+fallito, o un'eccezione interna non gestita (che comunque stampa le
+righe gia' costruite prima di uscire in errore). Tutto il resto
+(tshark assente, pcap/CSV mancanti, nessun fix GPS) degrada in modo
+morbido: quella parte specifica dell'evidenza produce meno righe (o
+lat=0/lng=0/crd=0, per la specifica sul "niente fix"), senza fermare
+lo script — invocato non presidiato da mdtmain PRIMA di impacchettare/
+inviare l'evidenza vera, un crash qui non deve mai poter bloccare
+quell'invio (vedi src/mdtmain_lib/masterlog.py/scheduler.package_and_push).
+"""
+import csv
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+MDTCONTRACT = os.path.join(REPO_ROOT, "mdtcontract")
+
+# Stesse 5 chiavi che report_finale.txt di mdtcap etichetta tutte come
+# "Warning ..." (vedi doc/EVIDENZE.md/README.md "Controlli extra"): la
+# loro somma, se > 0, produce UNA riga aggregata "DIAG" (non una per
+# campo).
+WARN_FIELDS = ("diagWarn", "warnPosD", "warnPosL", "warnMDTD", "warnMDTL")
+
+# Filtri tshark IDENTICI a quelli usati da mdtcap per calcolare
+# reqMDTPos (MET_ATTIVA_HITS)/reqMDTGPS (MET_MDT_REQ, MDT_REQUEST_ONLY_FILTER)
+# — vedi mdtcap righe ~2447-2464.
+MDT_FILTER = "lte-rrc.logMeasReportReq_r10"
+MDT_A_FILTER = ("lte-rrc.loggedMeasurementConfiguration_r10_element or "
+                "lte-rrc.ueInformationRequest_r9_element or "
+                "lte-rrc.ueInformationRequest_r16_element")
+
+# Decisione esplicita: il livello "I" ("Ignora: nessun problema", vedi
+# src/extra_scan) non produce righe ndjson, solo W/C/A. Un solo punto
+# da cambiare se in futuro serve anche "I".
+_EXTRA_LEVELS_EMITTED = {"W", "C", "A"}
+_EXTRA_CATEGORIES = ("SMSSTK", "NASId", "RRCCiph", "cellSys", "GPSLoc", "WCDMA3G")
+
+_HEXLINE_RE = re.compile(r'^[0-9a-fA-F]{4,8}\s+((?:[0-9a-fA-F]{2}\s+){1,16})')
+_EXTRA_HEADER_RE = re.compile(r'^\[([^\]]+)\]\s+([IWCA])\s+(\S+)\s+Log\s+(.*)$')
+
+
+class ScanlogsError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------
+# manifest.json
+# ---------------------------------------------------------------------
+
+def load_manifest(evidence_dir):
+    path = os.path.join(evidence_dir, "manifest.json")
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def sum_warn_fields(manifest):
+    return sum(int(manifest.get(k, 0) or 0) for k in WARN_FIELDS)
+
+
+def has_any_evidence(manifest):
+    """Predicato "c'e' qualcosa da riportare" (De Morgan gia' applicato,
+    niente AND-di-negazioni): vero se almeno uno dei flag MDT/RRC e'
+    presente, o la somma dei warning e' positiva, o l'evidenza e'
+    estesa con un extraLevel diverso da "I"."""
+    any_flag = any(manifest.get(k, False) for k in
+                   ("hasMDT", "reqMDTPos", "reqMDTGPS", "hasRRC", "hasRRCPos"))
+    any_warn = sum_warn_fields(manifest) > 0
+    extended_dirty = bool(manifest.get("extended", False)) and manifest.get("extraLevel", "I") != "I"
+    return any_flag or any_warn or extended_dirty
+
+
+# ---------------------------------------------------------------------
+# mdtcontract --get-devid
+# ---------------------------------------------------------------------
+
+def get_devid(mdtcontract_path):
+    try:
+        proc = subprocess.run([mdtcontract_path, "--get-devid"],
+                               capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise ScanlogsError(str(e))
+    if proc.returncode != 0:
+        raise ScanlogsError(proc.stderr.strip() or f"exit {proc.returncode}")
+    return proc.stdout.strip()
+
+
+def truncate_mki(devid):
+    """Schema server: "mki" e' una stringa ASCII di al massimo 32
+    caratteri — devid puo' venire da un UUID DMI (36 caratteri),
+    troncato qui difensivamente dopo aver scartato eventuali byte non
+    ASCII."""
+    return devid.encode("ascii", "ignore").decode("ascii")[:32]
+
+
+# ---------------------------------------------------------------------
+# posizione GPS media (periodic_cell_gps_decoded.csv)
+# ---------------------------------------------------------------------
+
+def average_gps_position(evidence_dir):
+    """(lat, lng) media sulle sole righe con gps_fix=="1", o None se il
+    file manca o zero righe qualificanti (niente fix in tutto il
+    test)."""
+    path = os.path.join(evidence_dir, "periodic_cell_gps_decoded.csv")
+    if not os.path.isfile(path):
+        return None
+    lats, lngs = [], []
+    try:
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                if row.get("gps_fix") != "1":
+                    continue
+                try:
+                    lats.append(float(row["gps_lat"]))
+                    lngs.append(float(row["gps_lon"]))
+                except (KeyError, ValueError, TypeError):
+                    continue
+    except OSError:
+        return None
+    if not lats:
+        return None
+    return sum(lats) / len(lats), sum(lngs) / len(lngs)
+
+
+def resolve_gps_for_row(avg, own_lat=None, own_lng=None):
+    """Unico punto che decide lat/lng/crd per qualunque riga (evita di
+    duplicare la logica "media o zero" in piu' punti). own_lat/own_lng
+    (solo RRC: sorgente GPS indipendente dal fix periodico) vincono
+    sempre quando forniti, a prescindere da avg."""
+    if own_lat is not None and own_lng is not None:
+        return own_lat, own_lng, 1
+    if avg is None:
+        return 0.0, 0.0, 0
+    return avg[0], avg[1], 0
+
+
+# ---------------------------------------------------------------------
+# tshark: estrazione campi + hex dump per singolo frame
+# ---------------------------------------------------------------------
+
+def find_pcap(evidence_dir):
+    matches = glob.glob(os.path.join(evidence_dir, "capture_*.pcap"))
+    return matches[0] if matches else None
+
+
+def run_tshark_fields(pcap, disp_filter, fields):
+    if not pcap or not os.path.isfile(pcap):
+        return []
+    cmd = ["tshark", "-r", pcap, "-Y", disp_filter, "-T", "fields",
+           "-E", "separator=,", "-E", "quote=d", "-E", "occurrence=f"]
+    for f in fields:
+        cmd += ["-e", f]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if out.returncode != 0:
+        return []
+    rows = []
+    for line in out.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = next(csv.reader([line]))
+        parts += [""] * (len(fields) - len(parts))
+        rows.append(dict(zip(fields, parts)))
+    return rows
+
+
+def frame_hex_dump(pcap, frame_number):
+    """Hex dump esadecimale dell'intero frame — stesso identico pattern
+    gia' provato in src/extra_scan.hexdump_for_frame (non una
+    reinvenzione): i due script producono cosi' hex dump identici per
+    lo stesso frame."""
+    if not pcap or not frame_number:
+        return ""
+    cmd = ["tshark", "-r", pcap, "-Y", f"frame.number=={frame_number}", "-x"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if out.returncode != 0:
+        return ""
+    hexbytes = []
+    for line in out.stdout.splitlines():
+        m = _HEXLINE_RE.match(line)
+        if not m:
+            if hexbytes:
+                break
+            continue
+        hexbytes.append(m.group(1).strip().replace(" ", ""))
+    return "".join(hexbytes).upper()
+
+
+def frame_time_epoch(pcap, frame_number):
+    rows = run_tshark_fields(pcap, f"frame.number=={frame_number}", ["frame.time_epoch"])
+    if not rows:
+        return None
+    try:
+        return float(rows[0]["frame.time_epoch"])
+    except (KeyError, ValueError):
+        return None
+
+
+def mdt_frame_events(pcap, disp_filter):
+    """Eventi per-frame MDT/MDT_A: nessun CSV pronto per questo tipo
+    (a differenza di RRC), quindi si reinterroga tshark direttamente
+    col filtro esatto gia' usato da mdtcap per il flag corrispondente."""
+    rows = run_tshark_fields(pcap, disp_filter, ["frame.number", "frame.time_epoch"])
+    events = []
+    for r in rows:
+        try:
+            tcr = int(float(r["frame.time_epoch"]))
+        except (KeyError, ValueError):
+            continue
+        dmp = frame_hex_dump(pcap, r.get("frame.number"))
+        events.append({"tcr": tcr, "dmp": dmp or None})
+    return events
+
+
+def rrc_events_from_csv(evidence_dir, pcap):
+    """coordinate_estratte.csv: una riga = un evento RRC con posizione
+    propria. "frame_time" e' testo locale-dipendente di tshark (non
+    affidabile da parsare) — si ricalcola "tcr" con una query tshark
+    dedicata per frame.time_epoch invece di interpretare quel testo.
+    Una riga senza lat/lon valide viene scartata singolarmente, mai
+    l'intero file."""
+    path = os.path.join(evidence_dir, "coordinate_estratte.csv")
+    if not os.path.isfile(path):
+        return []
+    events = []
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            try:
+                lat = float(row["latitude_deg"])
+                lng = float(row["longitude_deg"])
+            except (KeyError, ValueError, TypeError):
+                continue
+            frame_no = row.get("frame_number")
+            ts = frame_time_epoch(pcap, frame_no) if pcap and frame_no else None
+            tcr = int(ts) if ts is not None else 0
+            events.append({"tcr": tcr, "lat": lat, "lng": lng, "dmp": row.get("raw_hex") or None})
+    return events
+
+
+# ---------------------------------------------------------------------
+# DIAG: riga aggregata unica dai 5 contatori di warning
+# ---------------------------------------------------------------------
+
+def diag_event(manifest):
+    if sum_warn_fields(manifest) <= 0:
+        return None
+    try:
+        tcr = int(manifest.get("tcr", 0))
+    except (TypeError, ValueError):
+        tcr = 0
+    return {"tcr": tcr}
+
+
+# ---------------------------------------------------------------------
+# extra_scan_<CATEGORIA>.log: parsing eventi W/C/A
+# ---------------------------------------------------------------------
+
+def parse_extra_scan_log(path):
+    """Formato esatto prodotto da src/extra_scan.format_log_line: una
+    riga header "[iso] LEVEL CODE Log dettaglio", seguita
+    opzionalmente da una riga di continuazione con l'hex dump (stesso
+    CODE, MAI inizia per "["). Regola di accoppiamento robusta: una
+    riga che comincia con "[" apre un nuovo evento, qualunque riga che
+    NON comincia con "[" e' la continuazione dell'evento aperto subito
+    prima (piu' robusto di contare gli spazi di padding)."""
+    events = []
+    pending = None
+    with open(path) as f:
+        for raw_line in f:
+            line = raw_line.rstrip("\n")
+            if line.startswith("["):
+                if pending is not None:
+                    events.append(pending)
+                    pending = None
+                m = _EXTRA_HEADER_RE.match(line)
+                if not m:
+                    continue
+                iso_ts, level, code, _detail = m.groups()
+                ts = _parse_iso_utc(iso_ts)
+                pending = {"ts": ts, "level": level, "code": code, "dmp": None}
+            else:
+                if pending is not None:
+                    parts = line.strip().split(" ", 1)
+                    if len(parts) == 2 and parts[0] == pending["code"]:
+                        pending["dmp"] = parts[1].strip() or None
+                    events.append(pending)
+                    pending = None
+    if pending is not None:
+        events.append(pending)
+    return events
+
+
+def _parse_iso_utc(s):
+    import datetime
+    try:
+        return datetime.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def extra_scan_events(evidence_dir):
+    out = []
+    for cat in _EXTRA_CATEGORIES:
+        path = os.path.join(evidence_dir, f"extra_scan_{cat}.log")
+        if not os.path.isfile(path):
+            continue
+        for ev in parse_extra_scan_log(path):
+            if ev["level"] not in _EXTRA_LEVELS_EMITTED:
+                continue
+            out.append({"typ": cat, "tcr": int(ev["ts"]), "dmp": ev["dmp"]})
+    return out
+
+
+# ---------------------------------------------------------------------
+# assemblaggio riga ndjson
+# ---------------------------------------------------------------------
+
+def build_row(tcr, mki, sid, mcc, mnc, crd, lat, lng, typ, dmp):
+    return {
+        "tcr": tcr, "mki": mki, "sid": sid, "mcc": mcc, "mnc": mnc,
+        "crd": crd, "lat": lat, "lng": lng, "typ": typ, "dmp": dmp,
+    }
+
+
+# ---------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------
+
+def main(argv):
+    if len(argv) != 2:
+        print("uso: scanlogs <evidence_dir>", file=sys.stderr)
+        return 2
+    evidence_dir = argv[1]
+    if not os.path.isdir(evidence_dir):
+        print(f"scanlogs: directory non trovata: {evidence_dir}", file=sys.stderr)
+        return 1
+
+    manifest = load_manifest(evidence_dir)
+    if manifest is None:
+        print(f"scanlogs: manifest.json mancante/non leggibile in {evidence_dir}", file=sys.stderr)
+        return 1
+    if not has_any_evidence(manifest):
+        return 0
+
+    try:
+        mki = truncate_mki(get_devid(MDTCONTRACT))
+    except ScanlogsError as e:
+        print(f"scanlogs: mdtcontract --get-devid fallito: {e}", file=sys.stderr)
+        return 1
+
+    sid = os.path.basename(os.path.normpath(evidence_dir))
+    mcc, mnc = manifest.get("mcc", ""), manifest.get("mnc", "")
+    avg = average_gps_position(evidence_dir)
+    pcap = find_pcap(evidence_dir)
+    rows = []
+
+    try:
+        if manifest.get("reqMDTPos"):
+            for ev in mdt_frame_events(pcap, MDT_FILTER):
+                lat, lng, crd = resolve_gps_for_row(avg)
+                rows.append(build_row(ev["tcr"], mki, sid, mcc, mnc, crd, lat, lng, "MDT", ev["dmp"]))
+
+        if manifest.get("reqMDTGPS"):
+            for ev in mdt_frame_events(pcap, MDT_A_FILTER):
+                lat, lng, crd = resolve_gps_for_row(avg)
+                rows.append(build_row(ev["tcr"], mki, sid, mcc, mnc, crd, lat, lng, "MDT_A", ev["dmp"]))
+
+        if manifest.get("hasRRCPos"):
+            for ev in rrc_events_from_csv(evidence_dir, pcap):
+                lat, lng, crd = resolve_gps_for_row(avg, ev["lat"], ev["lng"])
+                rows.append(build_row(ev["tcr"], mki, sid, mcc, mnc, crd, lat, lng, "RRC", ev["dmp"]))
+
+        diag = diag_event(manifest)
+        if diag is not None:
+            lat, lng, crd = resolve_gps_for_row(avg)
+            rows.append(build_row(diag["tcr"], mki, sid, mcc, mnc, crd, lat, lng, "DIAG", None))
+
+        for ev in extra_scan_events(evidence_dir):
+            lat, lng, crd = resolve_gps_for_row(avg)
+            rows.append(build_row(ev["tcr"], mki, sid, mcc, mnc, crd, lat, lng, ev["typ"], ev["dmp"]))
+    except Exception as exc:  # fail-soft: mai un traceback grezzo, ma con exit non-zero (a differenza di extra_scan: qui non c'e' un "output di default" sicuro)
+        for row in rows:
+            print(json.dumps(row))
+        print(f"scanlogs: errore interno non gestito: {exc}", file=sys.stderr)
+        return 1
+
+    for row in rows:
+        print(json.dumps(row))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
