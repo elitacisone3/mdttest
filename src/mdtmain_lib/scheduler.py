@@ -284,7 +284,7 @@ def package_and_push(manifest, outdir, contract, host, day_state=None, quiet=Fal
     aggiornato per il pallino "Invio dati" del test continuo. Usata anche
     da "Esegui un test inviando i dati" (senza day_state, vedi app.py),
     che si affida al valore di ritorno per segnalare l'esito dell'invio
-    all'utente. PRIMA di impacchettare l'evidenza, invoca srv/scanlogs
+    all'utente. PRIMA di impacchettare l'evidenza, invoca src/scanlogs
     (vedi masterlog.py) e ne accumula l'output ndjson in
     log/masterSpool.ndjson/log/master.ndjson, tentando SUBITO l'invio
     (masterlog.flush_masterlog) esattamente come per l'evidenza sopra —

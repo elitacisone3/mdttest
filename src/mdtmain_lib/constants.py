@@ -74,14 +74,14 @@ SPOOL_UPLOAD_LIMIT_PER_CYCLE = 5
 LAST_ALARM_TEXT_FILE = os.path.join(REPO_ROOT, "log", "lastAlarm")
 LAST_ALARM_CONF_FILE = os.path.join(REPO_ROOT, "log", "lastAlarm.conf")
 
-# Output ndjson di srv/scanlogs (vedi src/mdtmain_lib/masterlog.py e
+# Output ndjson di src/scanlogs (vedi src/mdtmain_lib/masterlog.py e
 # scheduler.package_and_push): un meccanismo di spool analogo a
 # log/spool sopra, ma per un flat file append-only invece di file
 # .tar.gz.gpg individuali per ogni evidenza. masterSpool.ndjson e' la
 # coda di invio verso /api/masterLog (svuotata a invio riuscito O a
 # errore HTTP 400); master.ndjson e' la copia storica permanente, MAI
 # troncata.
-SCANLOGS_SCRIPT = os.path.join(REPO_ROOT, "srv", "scanlogs")
+SCANLOGS_SCRIPT = os.path.join(REPO_ROOT, "src", "scanlogs")
 MASTER_SPOOL_FILE = os.path.join(REPO_ROOT, "log", "masterSpool.ndjson")
 MASTER_LOG_FILE = os.path.join(REPO_ROOT, "log", "master.ndjson")
 

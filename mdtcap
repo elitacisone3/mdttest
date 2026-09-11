@@ -1119,19 +1119,20 @@ tui_build_steps() {
     tui_add manifest "Scrittura manifest"
 
     # "Controlli extra:" (--extended, vedi src/extra_scan): un pallino per
-    # categoria, sempre presente (etichette stabili) se le definizioni sono
-    # state risolte da extra_scan_get_defs() all'avvio — indipendentemente
-    # da --extended (vedi commento li' sopra). Restano "pending" (grigio)
-    # con una nota esplicita se --extended non e' stato richiesto per
-    # QUESTA esecuzione; altrimenti compute_extra_scan() li aggiorna a fine
-    # cattura con il livello/conteggio effettivo di ciascuna categoria.
-    if (( ${#EXTRA_SCAN_DEFS_ORDER[@]} > 0 )); then
+    # categoria, SOLO se --extended e' stato richiesto per QUESTA
+    # esecuzione (a differenza di report_finale.txt, che mostra comunque
+    # le intestazioni con "non richiesto" anche senza --extended, vedi
+    # generate_final_report()): nella TUI, in tempo reale, una sezione
+    # sempre presente ma sempre "pending"/grigia quando --extended non e'
+    # usato (il caso piu' comune) era solo rumore visivo senza alcuna
+    # informazione utile. compute_extra_scan() aggiorna questi pallini a
+    # fine cattura con il livello/conteggio effettivo di ciascuna categoria.
+    if [[ "$EXTENDED" -eq 1 && ${#EXTRA_SCAN_DEFS_ORDER[@]} -gt 0 ]]; then
         tui_blank
         tui_header "Controlli extra:"
         local ec
         for ec in "${EXTRA_SCAN_DEFS_ORDER[@]}"; do
             tui_add "extra_cat_$ec" "${EXTRA_SCAN_DEFS[$ec]} ($ec)"
-            [[ "$EXTENDED" -eq 1 ]] || TUI_STEP_NOTE["extra_cat_$ec"]="non richiesto (--extended non specificato)"
         done
     fi
 

@@ -7,7 +7,7 @@ Endpoint (vedi main_configs/server.conf per l'host):
   POST /api/imeiRequest/<token>/<devId>      raw octet-stream, max 512 byte
   POST /api/push/<CONTRACT>/<nomeDirectory>  raw octet-stream (evidenza cifrata)
                                               risposta: sha256 esadecimale
-  POST /api/masterLog                        raw ndjson (vedi srv/scanlogs,
+  POST /api/masterLog                        raw ndjson (vedi src/scanlogs,
                                               src/mdtmain_lib/masterlog.py)
                                               200/400: {"inserted": N}
 """

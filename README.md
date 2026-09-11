@@ -1,5 +1,7 @@
 # mdtcap: Minimization of Drive Tests Capture.
 
+![mdtcap](src/res/mdtcap.png)
+
 **Versione beta (2.0-beta)**
 
 Tool per rilevare le evidenze di tracciamento/utilizzo dell'MDT
@@ -1177,8 +1179,11 @@ SHA-256 (così i file scritti finiscono nella catena di custodia), viene
 invocato `src/extra_scan` sull'outdir corrente. Indipendentemente da
 `--extended`, mdtcap chiama sempre `src/extra_scan --get-defs` all'avvio
 (se lo script è presente) per etichettare stabilmente la sezione
-"Controlli extra:" di report/TUI: senza `--extended` quella sezione
-mostra solo le intestazioni, mai un livello/conteggio.
+"Controlli extra:" di `report_finale.txt`: senza `--extended` quella
+sezione mostra solo le intestazioni, mai un livello/conteggio. Nella
+TUI (`--tui`) invece la sezione compare **solo** con `--extended`: senza,
+sarebbe stata solo una sezione grigia/pending per l'intera cattura,
+senza alcuna informazione utile in tempo reale.
 
 `--ext-profile NOME` alimenta il `--profile` di `src/extra_scan` (risolto
 in `extra_configs/profile/NOME.conf`), **non** lo stesso `--profile` di
@@ -1900,10 +1905,15 @@ NetworkManager o dhcpcd+wpa_supplicant): da lì si può anche scegliere
 mostra sempre `MDTCap <versione>` a sinistra e hostname/IP (o
 `NO INTERNET`) a destra.
 
+All'avvio, la primissima volta, compare anche un disclaimer generale sul
+programma (`startDisclaim` in `main_configs/mdtmain.conf`, vedi sotto):
+non si ripete alle esecuzioni successive.
+
 Il menu principale offre **sempre** tutte le opzioni seguenti,
 indipendentemente dalla connessione a Internet (le modalità che la
 richiedono davvero segnalano l'errore solo se effettivamente provano a
-contattare il server):
+contattare il server) **tranne 3 e 4**, nascoste se `disableSend=1`
+(default, vedi "Privacy" sotto e la tabella `mdtmain.conf` più sotto):
 
 1. **Esegui un test in locale** (senza salvare): sceglie un profilo da
    `mdt_configs/profile/`, chiede il PIN della SIM (facoltativo) e la
@@ -1941,7 +1951,11 @@ contattare il server):
    `mdtcontract --get-devid`.
 9. **Impostazioni**: avvio automatico, allarmi attivi/su HDMI e relativa
    fascia oraria, fix GPS forzato prima dei test, test approfonditi
-   (`--extended`) e modalità test SMS (`--test-sms`, vedi sotto); scrive
+   (`--extended`), modalità test SMS (`--test-sms`, vedi sotto) e
+   disabilitazione dell'invio delle evidenze (`disableSend`, vedi sotto
+   e "Privacy" più sotto: attivandola cancella anche PIN/ICCID del test
+   continuato salvato, e la prima volta mostra un avviso dedicato);
+   scrive
    `main_configs/mdtmain.conf`.
 
 In ogni test: si conferma sempre l'inserimento della SIM, e un tasto
@@ -1968,6 +1982,9 @@ stesso (schermata "Impostazioni", "Imposta test continuato"):
 | `doGPSFix` | `0` | se `1`, prima di **qualunque** test attende un fix GPS (`mdtgps` in background, "Attesa fix GPS...") così il test parte già con un fix "caldo"; un fix mancato avvisa ma non blocca il test |
 | `forceExtended` | `0` | se `1`, aggiunge `--extended` a ogni invocazione di `mdtcap`, anche se il profilo/la schedulazione usata non lo prevede già da solo (vedi "Controlli extra" sopra) |
 | `testSMS` | `0` | se `1`, aggiunge `--test-sms` a ogni invocazione di `mdtcap` (implica `--extended` da solo, vedi "Trigger di test via SMS" sopra); usare solo per verificare la catena di rilevamento, mai in un test reale |
+| `disableSend` | `1` | se `1` (default), nasconde dal menu principale "Esegui un test inviando i dati"/"Imposta test continuato" (le uniche due modalità che inviano dati a un server, vedi "Privacy" più sotto); attivandolo da Impostazioni cancella anche `testPin`/`testSim` |
+| `startDisclaim` | `0` | diventa `1` dopo il primo avvio, quando compare il disclaimer generale del programma; non si ripete |
+| `dataDisclaim` | `0` | diventa `1` la prima volta che si tocca `disableSend` dalla schermata Impostazioni, quando compare il disclaimer sull'invio dati; non si ripete |
 
 ### Modalità a schermo intero (`--screen`)
 
@@ -2017,6 +2034,13 @@ se il contratto (device+SIM, vedi `mdtcontract`) risulta già registrato;
 se non lo è, chiede un **token di verifica remoto** e lo invia per la
 registrazione. Senza un token valido accettato dal server, l'invio non
 procede.
+
+Coerentemente, `mdtmain` tiene queste due modalità **disattivate di
+default** (`disableSend=1` in `main_configs/mdtmain.conf`, vedi "Impostazioni"
+più sotto): vanno abilitate esplicitamente dalla schermata Impostazioni,
+dove compare anche un avviso che ricorda che questa parte del programma
+è riservata al progetto di monitoraggio e richiede un token di accesso,
+non va usata con SIM personali.
 
 Spiegazione completa, senza tecnicismi, in
 [doc/PRIVACY.md](doc/PRIVACY.md): include anche a cosa può servire il

@@ -18,6 +18,17 @@ from . import (constants, contract, edgemode, evidence, httpclient, masterlog, m
                ui, usbmount)
 
 
+_STARTUP_DISCLAIM_TEXT = """Attenzione:
+
+Questo programma è in versione beta. Non è un tool di sicurezza né un
+tool di offesa.
+Si utilizza per vedere se l'operatore telefonico traccia gli spostamenti
+con MDT o altre tecniche.
+Le configurazioni extra sono sperimentali. I dati vanno visionati da
+personale esperto.
+Si declina ogni responsabilità per un uso scorretto."""
+
+
 def run_app(skip_network_setup=False, force_network_setup=False, auto_start=False):
     """skip_network_setup (--main): salta la schermata di rete anche
     senza Internet. force_network_setup (--net-menu): la mostra sempre,
@@ -29,8 +40,16 @@ def run_app(skip_network_setup=False, force_network_setup=False, auto_start=Fals
     riselezione profilo (vedi _resume_continuous_test) — se l'ICCID
     della SIM inserita non corrisponde, mostra un errore e prosegue con
     il flusso normale (autoStart NON viene disattivato: e' una modalita'
-    persistente, si disattiva solo dalla schermata Impostazioni)."""
+    persistente, si disattiva solo dalla schermata Impostazioni).
+
+    Non chiamata da run_edge_mode() (--edge-mode e' un percorso separato,
+    pensato per girare senza terminale/interazione): il disclaimer di
+    avvio sotto e' quindi mostrato solo nei percorsi interattivi
+    (lancio normale, --auto-start), mai in un deployment headless."""
     config = mdtmain_config.load()
+    if not mdtmain_config.get_bool(config, "startDisclaim"):
+        mdtmain_config.update(startDisclaim="1")
+        ui.screen_msgbox(_STARTUP_DISCLAIM_TEXT)
     disable_net = mdtmain_config.get_bool(config, "disableNet")
     has_internet = netinfo.has_internet()
 
@@ -164,14 +183,20 @@ def screen_main_menu(has_internet):
     ui.refresh_background_title(has_internet)
     config = mdtmain_config.load()
     choices = [("1", "Esegui un test in locale (senza salvare)"),
-               ("2", "Esegui un test salvando le evidenze su chiavetta USB"),
-               ("3", "Esegui un test inviando i dati"),
-               ("4", "Imposta test continuato (condividendo le evidenze)"),
-               ("5", "Test baseband"),
-               ("6", "Test GPS"),
-               ("7", "Download certificato identità di rete"),
-               ("8", "Identità sistema"),
-               ("9", "Impostazioni")]
+               ("2", "Esegui un test salvando le evidenze su chiavetta USB")]
+    # "3"/"4" sono le uniche due modalita' che inviano dati a un server:
+    # nascoste (non solo bloccate a schermata scelta) se disableSend=1
+    # (default), stesso schema gia' usato sotto per "10"-"13" (numeri
+    # riservati/stabili, aggiunti solo se applicabile - la dispatch piu'
+    # sotto non cambia).
+    if not mdtmain_config.get_bool(config, "disableSend"):
+        choices.append(("3", "Esegui un test inviando i dati"))
+        choices.append(("4", "Imposta test continuato (condividendo le evidenze)"))
+    choices += [("5", "Test baseband"),
+                ("6", "Test GPS"),
+                ("7", "Download certificato identità di rete"),
+                ("8", "Identità sistema"),
+                ("9", "Impostazioni")]
     # Mostrata solo se c'e' davvero qualcosa da inviare (evidenza rimasta
     # in log/spool da un invio immediato fallito, vedi
     # scheduler.package_and_push/flush_spool): non ha senso proporla
@@ -236,6 +261,14 @@ def _ask_hour(label, current):
         return int(raw)
 
 
+_DATA_DISCLAIM_TEXT = """Attenzione:
+
+L'utilizzo di questa parte del programma è riservato al progetto di
+monitoraggio.
+Non vanno usate le SIM personali.
+Occorrono dei token di accesso per abilitare l'invio dei dati."""
+
+
 def screen_settings():
     config = mdtmain_config.load()
     items = [
@@ -246,17 +279,19 @@ def screen_settings():
         ("extended", "Imposta i test approfonditi", mdtmain_config.get_bool(config, "forceExtended")),
         ("testsms", "Modalità test SMS", mdtmain_config.get_bool(config, "testSMS")),
         ("checkpoint", "Abilita la sirena nei checkpoint", mdtmain_config.get_bool(config, "alarmCheckPoint")),
+        ("disablesend", "Disabilita l'invio delle evidenze", mdtmain_config.get_bool(config, "disableSend")),
     ]
     selected = ui.screen_checklist("Impostazioni", "Selezionare le opzioni attive:", items)
     if selected is None:
         return
-    min_hour = _ask_hour("Allarmi dalle ore", mdtmain_config.get_hour(config, "minAlarmHour"))
-    if min_hour is None:
-        return
-    max_hour = _ask_hour("Allarmi fino alle ore", mdtmain_config.get_hour(config, "maxAlarmHour"))
-    if max_hour is None:
-        return
-    mdtmain_config.update(
+    # Salvate SUBITO, prima di chiedere le ore allarme sotto: due passi
+    # logicamente separati (checklist / fascia oraria), che non devono
+    # condividere un solo "annulla": altrimenti un Cancel sulla sola
+    # fascia oraria (schermata successiva, scollegata dalla checklist)
+    # scartava in silenzio anche le scelte appena fatte qui sopra
+    # (es. disableSend), lasciando tutto come prima senza alcun avviso.
+    disable_send = "1" if "disablesend" in selected else "0"
+    updates = dict(
         autoStart="1" if "autostart" in selected else "0",
         disableAlarm="0" if "alarms" in selected else "1",
         hdmi="1" if "hdmi" in selected else "0",
@@ -264,9 +299,26 @@ def screen_settings():
         forceExtended="1" if "extended" in selected else "0",
         testSMS="1" if "testsms" in selected else "0",
         alarmCheckPoint="1" if "checkpoint" in selected else "0",
-        minAlarmHour=str(min_hour),
-        maxAlarmHour=str(max_hour),
+        disableSend=disable_send,
     )
+    if disable_send == "1":
+        # Cosi' un test continuato gia' configurato non puo' piu' ripartire
+        # da solo (--auto-start/"Riprendi test continuo" richiedono
+        # testSim non vuoto, vedi run_app/screen_main_menu).
+        updates["testPin"] = ""
+        updates["testSim"] = ""
+    mdtmain_config.update(**updates)
+    if disable_send == "1" and not mdtmain_config.get_bool(config, "dataDisclaim"):
+        mdtmain_config.update(dataDisclaim="1")
+        ui.screen_msgbox(_DATA_DISCLAIM_TEXT)
+
+    min_hour = _ask_hour("Allarmi dalle ore", mdtmain_config.get_hour(config, "minAlarmHour"))
+    if min_hour is None:
+        return
+    max_hour = _ask_hour("Allarmi fino alle ore", mdtmain_config.get_hour(config, "maxAlarmHour"))
+    if max_hour is None:
+        return
+    mdtmain_config.update(minAlarmHour=str(min_hour), maxAlarmHour=str(max_hour))
     ui.screen_msgbox("Impostazioni salvate.")
 
 
@@ -700,6 +752,12 @@ def _prepare_server_test(confirm_text, prefill_pin=None):
         return None
     if not ui.screen_yesno(confirm_text):
         return None
+    # Da qui in poi solo I/O bloccante (lettura SIM, chiamate al server):
+    # senza un indicatore la UI resta ferma sull'ultima schermata per
+    # qualche secondo, sembrando bloccata/in crash. "Caricamento..." resta
+    # visibile finche' non appare la prossima schermata/msgbox (screen_infobox
+    # non richiede una chiusura esplicita, vedi ui.screen_infobox).
+    ui.screen_infobox("Caricamento...")
     try:
         iccid, contract_id = contract.get_sim_user()
     except contract.ContractError as e:

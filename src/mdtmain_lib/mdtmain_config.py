@@ -41,6 +41,22 @@ assente/non valida):
                      dello scheduler (vedi main_configs/profile/,
                      src/mdtmain_lib/scheduler.py) — se 0, ogni riga
                      CHECKPOINT e' completamente inerte.
+  disableSend   0/1  Default 1 (invio disattivato di default): disabilita
+                     "Esegui un test inviando i dati"/"Imposta test
+                     continuato" (menu principale), le uniche due
+                     modalita' che parlano con un server. Impostarlo a 1
+                     dalla schermata Impostazioni cancella anche
+                     testPin/testSim, cosi' un test continuato gia'
+                     configurato non puo' piu' ripartire da solo (vedi
+                     app.screen_settings).
+  startDisclaim 0/1  Default 0: diventa 1 la prima volta che mdtmain
+                     mostra il disclaimer generale all'avvio (vedi
+                     app.run_app) - "hai gia' accettato", non si ripete.
+  dataDisclaim  0/1  Default 0: diventa 1 la prima volta che si abilita
+                     l'invio dati dalla schermata Impostazioni e ne
+                     compare il disclaimer dedicato (vedi
+                     app.screen_settings) - "hai gia' accettato", non si
+                     ripete.
 """
 import os
 
@@ -62,10 +78,14 @@ DEFAULTS = {
     "forceExtended": "0",
     "testSMS": "0",
     "alarmCheckPoint": "1",
+    "disableSend": "1",
+    "startDisclaim": "0",
+    "dataDisclaim": "0",
 }
 
 _BOOL_KEYS = {"disableNet", "disableIMEI", "disableAlarm", "autoStart", "hdmi", "doGPSFix",
-              "forceExtended", "testSMS", "alarmCheckPoint"}
+              "forceExtended", "testSMS", "alarmCheckPoint",
+              "disableSend", "startDisclaim", "dataDisclaim"}
 _HOUR_KEYS = {"minAlarmHour", "maxAlarmHour"}
 
 

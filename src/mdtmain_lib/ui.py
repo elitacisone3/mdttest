@@ -15,6 +15,18 @@ import dialog
 
 from . import alarmstate, constants, netinfo
 
+# ESCDELAY basso (alcune distro lo riducono per un ESC piu' reattivo in
+# editor come vim) fa scambiare a ncurses una sequenza freccia/funzione
+# (ESC seguito da altri byte) per un ESC "solitario" se quei byte non
+# arrivano abbastanza vicini nel tempo - facile su una sessione SSH con
+# anche solo un po' di jitter: un tasto freccia premuto normalmente puo'
+# essere interpretato come "Annulla" (ESC chiude qualunque dialog), con
+# l'effetto di un checkbox/menu che sembra "non rispondere" pur avendo
+# ricevuto davvero la pressione del tasto. 100ms e' il valore raccomandato
+# da ncurses stesso per questo problema; setdefault non sovrascrive un
+# valore che l'utente avesse gia' impostato nel proprio ambiente.
+os.environ.setdefault("ESCDELAY", "100")
+
 _d = dialog.Dialog(dialog="dialog")
 _d.set_background_title(f"MDTCap {constants.VERSION}")
 
@@ -140,22 +152,27 @@ def screen_passwordbox(text, init="", title=None, width=70):
 
 
 def screen_msgbox(text, title=None):
-    """Dimensiona il box in base al contenuto (fino ai limiti del
-    terminale reale), invece del width fisso/height=0 di prima: con un
-    report lungo (--report/--parla-chiaro), "height=0" lasciava scegliere
-    a dialog un'altezza inferiore a quella davvero disponibile,
-    troncando il contenuto dietro un indicatore di scorrimento
-    ("35%" ecc., in basso a destra) molto prima del necessario —
-    verificato catturando l'output raw: con le dimensioni del terminale
-    invece dei valori fissi precedenti, lo stesso contenuto mostra molte
-    piu' righe prima di doverci ricorrere davvero. Un report molto lungo
-    su un terminale piccolo puo' comunque richiedere lo scorrimento
-    (frecce/PagSu/PagGiu'): a quel punto e' legittimo, non piu' un
-    taglio inutile."""
+    """Dimensiona il box sul CONTENUTO reale (altezza = numero di righe,
+    larghezza = riga piu' lunga), entrambe con un margine fisso e capate
+    alle dimensioni del terminale reale, invece di height/width fissi.
+    L'altezza gia' andava cosi': con un report lungo (--report/
+    --parla-chiaro), "height=0" lasciava scegliere a dialog un'altezza
+    inferiore a quella davvero disponibile, troncando il contenuto dietro
+    un indicatore di scorrimento ("35%" ecc.) molto prima del necessario.
+    La larghezza pero' usava SEMPRE la larghezza intera del terminale,
+    anche per un testo di una riga ("Impostazioni salvate."): un riquadro
+    enorme per un messaggio breve. Ora la larghezza segue il contenuto
+    (con un minimo per restare un riquadro riconoscibile, non una
+    fessura), lo stesso identico contenuto lungo continua comunque a
+    ricevere tutta la larghezza disponibile quando gli serve davvero
+    (nessuna riga del testo puo' essere piu' larga del terminale stesso,
+    quindi min()/max() qui sotto arrivano comunque al caso precedente)."""
     term_size = shutil.get_terminal_size(fallback=(80, 24))
-    content_lines = text.count("\n") + 1
+    lines = text.split("\n")
+    content_lines = len(lines)
+    content_width = max((len(line) for line in lines), default=0)
     height = min(content_lines + 4, max(1, term_size.lines - 2))
-    width = max(1, term_size.columns - 4)
+    width = min(max(content_width + 4, 30), max(1, term_size.columns - 4))
     _d.msgbox(text, height=height, width=width, **_title_kwargs(title))
 
 

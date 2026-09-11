@@ -1,4 +1,4 @@
-"""Output ndjson di srv/scanlogs: log/masterSpool.ndjson (buffer di invio
+"""Output ndjson di src/scanlogs: log/masterSpool.ndjson (buffer di invio
 pendente verso /api/masterLog, svuotato a invio riuscito O a errore HTTP
 400 — mai altrimenti) e log/master.ndjson (copia storica permanente, mai
 troncata). Stile "spool" analogo a evidence.py (vedi le sue funzioni
@@ -25,7 +25,7 @@ class ScanlogsError(Exception):
 
 
 def run_scanlogs(outdir, timeout=120):
-    """Esegue srv/scanlogs <outdir> e ritorna il suo stdout (ndjson, puo'
+    """Esegue src/scanlogs <outdir> e ritorna il suo stdout (ndjson, puo'
     essere vuoto: "nessuna evidenza", non un errore). Solleva
     ScanlogsError SOLO se lo script stesso fallisce (exit non zero, non
     trovato, timeout)."""
@@ -42,7 +42,7 @@ def run_scanlogs(outdir, timeout=120):
 
 
 def append_scan_output(ndjson_text):
-    """Aggiunge ndjson_text (stdout gia' prodotto da srv/scanlogs) sia a
+    """Aggiunge ndjson_text (stdout gia' prodotto da src/scanlogs) sia a
     log/masterSpool.ndjson (buffer di invio) sia a log/master.ndjson
     (storico permanente, MAI troncato) — no-op se ndjson_text e' vuoto
     (nessuna evidenza rilevante in questo test)."""
