@@ -6,7 +6,7 @@ usarlo), non un parere di un avvocato. Il progetto stesso lo dice
 esplicitamente: questa funzionalità **non è pensata per uso corrente**,
 è stata predisposta per un eventuale uso futuro in un ambiente
 controllato (banco di prova isolato, celle simulate), **dopo** una
-verifica da parte di un avvocato competente in materia — non prima, e
+verifica da parte di un avvocato competente in materia, non prima, e
 non al posto di quella verifica.
 
 Se questo documento e quello che segue non bastano a farti decidere con
@@ -15,12 +15,12 @@ con un avvocato.
 
 > Impostare un IMEI diverso da quello originale (`--imei`) richiede un
 > cancello di autorizzazione firmata GPG (vedi "Cosa fa `mdtimei` per
-> limitare questi rischi" più sotto) — `--restore` (ripristino
+> limitare questi rischi" più sotto); `--restore` (ripristino
 > dell'originale) no. Tutti i rischi legali/normativi descritti in
 > questo documento restano gli stessi: l'autorizzazione limita
 > **chi/quando/per quale device+SIM+IMEI** è tecnicamente possibile
 > farlo con questo script, non **se** cambiare l'IMEI sia lecito nella
-> propria giurisdizione — quella resta una domanda per un avvocato, non
+> propria giurisdizione: quella resta una domanda per un avvocato, non
 > per questo tool.
 
 ## Cos'è l'IMEI e perché è regolamentato
@@ -45,7 +45,7 @@ impostazione tecnica.
 ## Perché può essere illegale (in generale, non solo in Italia)
 
 Molti paesi vietano esplicitamente, o rendono un reato a sé, la
-modifica/alterazione dell'IMEI di un apparato mobile — spesso a
+modifica/alterazione dell'IMEI di un apparato mobile, spesso a
 prescindere dall'intenzione con cui la si fa, e a volte anche solo il
 *possesso* di strumenti pensati per farlo può rilevare. In altri paesi
 non esiste un divieto specifico sull'IMEI in sé, ma la stessa condotta
@@ -67,10 +67,10 @@ dello stesso paese può dipendere da:
 
 Per questo l'unica risposta responsabile è: **verificare la situazione
 specifica con un avvocato**, nella giurisdizione rilevante, prima di
-usare `mdtimei` — non basarsi su questo documento né su ricerche
+usare `mdtimei`: non basarsi su questo documento né su ricerche
 informali. A differenza di altri script del progetto, ogni esecuzione
 **reale** (senza `--mock-time`) che supera l'autorizzazione cambia
-davvero l'IMEI del modulo — `--mock-time` esiste solo per testare la
+davvero l'IMEI del modulo: `--mock-time` esiste solo per testare la
 catena di autorizzazione (lettura ICCID, calcolo del contractId, esito
 di `src/testauth`) e non tocca **mai** l'hardware, vedi più sotto: non è
 un motivo per abbassare la guardia sull'uso reale.
@@ -87,17 +87,17 @@ un motivo per abbassare la guardia sull'uso reale.
   documentazione pubblica è quasi certamente già stato usato da
   innumerevoli altri dispositivi/test, con un rischio concreto di
   comparire come "duplicato" nei sistemi di rete e negli EIR degli
-  operatori — tanto più se il valore è scelto a caso invece che
+  operatori, tanto più se il valore è scelto a caso invece che
   generato/allocato correttamente per lo scopo. **L'autorizzazione
   firmata non convalida il valore dell'IMEI in sé**: attesta solo che
   qualcuno con la chiave radice ha approvato QUEL valore per QUEL
-  device/SIM/periodo — resta responsabilità di chi firma
+  device/SIM/periodo: resta responsabilità di chi firma
   l'autorizzazione scegliere un IMEI di test appropriato.
 - **Nessun ripristino automatico**: `mdtimei --imei` imposta l'IMEI
-  indicato e riavvia, punto — NON torna da sola all'IMEI originale a
+  indicato e riavvia, punto: NON torna da sola all'IMEI originale a
   fine esecuzione. Il dispositivo resta con l'IMEI nuovo finché non si
   rilancia esplicitamente `mdtimei --restore` (equivalente
-  all'IMEI salvato in `mdt_configs/imei`) — **`--restore` non richiede
+  all'IMEI salvato in `mdt_configs/imei`): **`--restore` non richiede
   autorizzazione**, vedi sotto.
 - **Impatto sulla rete reale**: agganciarsi con un IMEI alterato a una
   rete commerciale in produzione (non simulata) coinvolge l'infrastruttura
@@ -108,18 +108,19 @@ un motivo per abbassare la guardia sull'uso reale.
 
 Per impostare un IMEI diverso da quello originale (`--imei`), `mdtimei`
 non permette di procedere senza un'autorizzazione firmata GPG (vedi la
-sezione "Autorizzazione al cambio IMEI (`src/testauth`)" nel README per
-il formato completo), verificata così:
+sezione "Autorizzazione al cambio IMEI (`src/testauth`)" in
+[CAMBIO_IMEI.md](CAMBIO_IMEI.md) per il formato completo), verificata
+così:
 
 - legge l'ICCID della SIM **attualmente inserita** (`AT+CCID`) e calcola
   un `contractId` che lega insieme questo device e quella SIM
-  (`mdtcontract`) — l'autorizzazione può quindi restringersi a una
+  (`mdtcontract`): l'autorizzazione può quindi restringersi a una
   combinazione specifica device+SIM, non solo all'IMEI target;
 - verifica con `src/testauth` che un'autorizzazione valida (firmata dalla
   chiave radice del progetto, o da una chiave da questa delegata) esista
   per QUESTO device (`DEVID`), QUESTA SIM (`ICCID`), l'IMEI che si sta
   per impostare e/o il `contractId` calcolato, entro l'eventuale
-  finestra di date (`FROM`/`TO`) indicata — **abortisce senza toccare il
+  finestra di date (`FROM`/`TO`) indicata: **abortisce senza toccare il
   modulo** se manca, è scaduta, o non corrisponde;
 - solo dopo un'autorizzazione valida, chiede di rimuovere **fisicamente**
   la SIM appena verificata e di premere invio prima di procedere: il
@@ -128,7 +129,7 @@ il formato completo), verificata così:
   (il modulo può restare temporaneamente "convinto" di avere ancora una
   SIM finché non viene interrogato di nuovo: se `AT+CCID` risponde
   ancora qualcosa a quel punto lo script stampa un'ATTENZIONE ma
-  **procede comunque** — verificare a vista, non fidarsi solo
+  **procede comunque**: verificare a vista, non fidarsi solo
   dell'assenza dell'avviso);
 - `--mock-time yyyy/mm/dd` permette di testare l'intera catena sopra
   (lettura ICCID, calcolo contractId, esito dell'autorizzazione) **senza
@@ -140,22 +141,22 @@ A queste si sommano altre protezioni, non legate all'autorizzazione:
 
 - Stampa sempre un avviso di rischio, e per `--restore` richiede
   comunque conferma esplicita (`CONFERMO`, salvo `--yes` per uso
-  scriptato già controllato) — mostrando l'IMEI attuale e quello che sta
+  scriptato già controllato), mostrando l'IMEI attuale e quello che sta
   per essere impostato, cosi' da accorgersi subito di un valore sbagliato
   prima di applicarlo. Per `--imei`, questa conferma testuale è
   **sostituita** dal cancello di autorizzazione + rimozione SIM sopra
   (due controlli più forti di una semplice parola digitata).
 - Salva l'IMEI originale in `mdt_configs/imei` (se non già presente)
-  PRIMA di toccarlo, cosi' resta un riferimento per tornare indietro —
-  ma **il ripristino va rilanciato a mano** (`mdtimei --restore`,
-  nessuna autorizzazione richiesta per questo), non è automatico.
+  PRIMA di toccarlo, cosi' resta un riferimento per tornare indietro;
+  **il ripristino va rilanciato a mano** (`mdtimei --restore`, nessuna
+  autorizzazione richiesta per questo), non è automatico.
 - Dopo `AT+CRESET`, verifica che il modulo torni raggiungibile e che
   `AT+SIMEI?` confermi davvero il nuovo valore, invece di dare per
   scontato che il comando sia andato a buon fine.
 
-Tutto il resto — verificare di essere su una cella simulata, chi ha il
+Tutto il resto (verificare di essere su una cella simulata, chi ha il
 diritto di firmare un'autorizzazione e con quali criteri, ricordarsi di
-ripristinare l'IMEI originale a fine test — è **responsabilità di chi
+ripristinare l'IMEI originale a fine test) è **responsabilità di chi
 firma l'autorizzazione e di chi lancia lo script**, non del codice.
 Nessuna di queste misure sostituisce comunque: (a) l'autorizzazione
 **legale** a farlo nella propria giurisdizione (l'autorizzazione firmata
@@ -171,15 +172,15 @@ Checklist minima, non esaustiva:
 1. Parere scritto di un avvocato competente in materia, nella
    giurisdizione in cui il test avverrà fisicamente.
 2. Ambiente realmente isolato dalla rete pubblica (cella simulata in
-   gabbia di Faraday, o equivalente) — mai una rete commerciale reale.
+   gabbia di Faraday, o equivalente): mai una rete commerciale reale.
 3. Dispositivo e SIM di cui si ha piena proprietà/autorizzazione
    esplicita a modificare, non di terzi.
 4. Un IMEI di test allocato/generato correttamente per lo scopo (non un
    valore preso a caso da un esempio pubblico), se lo scenario lo
-   richiede — e un'autorizzazione firmata (`src/testauth --create`) che
+   richiede, e un'autorizzazione firmata (`src/testauth --create`) che
    lo restringa esplicitamente a questo device/SIM/periodo, per chi ha
    accesso alla chiave radice o a una delegata.
-5. Un piano di ripristino verificato prima di iniziare — `mdtimei`
+5. Un piano di ripristino verificato prima di iniziare: `mdtimei`
    NON ripristina da solo: assicurarsi che `mdt_configs/imei` contenga
    l'IMEI originale corretto e sapere già come/quando rilanciare
    `mdtimei --restore` per tornare indietro (nessuna autorizzazione

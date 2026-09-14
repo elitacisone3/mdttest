@@ -4,8 +4,8 @@ Guida tecnica per leggere e interpretare l'output di una cattura
 `mdtcap` (live o replay via `--analyze-dlf`/`--analyze-pcap`). Presuppone
 familiarità con RRC/LTE (TS 36.331) e con l'uso base di `tshark`/Wireshark;
 per l'elenco completo e autoritativo dei file prodotti vedi la sezione 4
-del [README](../README.md), qui ci si concentra su come leggerli e su
-cosa concludere (o non concludere) da ciascuno.
+di [GUIDA_MDTCAP.md](GUIDA_MDTCAP.md), qui ci si concentra su come
+leggerli e su cosa concludere (o non concludere) da ciascuno.
 
 ## Il meccanismo osservato: gli IE RRC legati all'MDT
 
@@ -58,7 +58,7 @@ ordine di lettura consigliato:
 | `session.log` | log completo dell'intera esecuzione | traccia ogni passo temporale (utile per correlare un evento RRC con un'azione specifica, es. un ciclo `--reconnect-interval`) |
 | `hashes_sha256.txt` | hash SHA-256 di tutti i file prodotti | verifica di integrità, vedi sotto |
 | `manifest.txt` / `manifest.json` | riepilogo dell'esecuzione, leggibile da umano/da script | vedi sezione dedicata sotto |
-| `extra_scan_report.txt` / `extra_scan*.log` (solo con `--extended`) | indizi di comportamento di rete sospetto/malevolo (IMSI-catcher), per categoria | vedi README.md, sezione "Controlli extra" — un indizio da verificare, non un verdetto |
+| `extra_scan_report.txt` / `extra_scan*.log` (solo con `--extended`) | indizi di comportamento di rete sospetto/malevolo (IMSI-catcher), per categoria | vedi [GUIDA_MDTCAP.md](GUIDA_MDTCAP.md), sezione "Controlli extra": un indizio da verificare, non un verdetto |
 
 ## Leggere `manifest.json`
 
@@ -189,5 +189,5 @@ l'operatore sceglie di rendere noto.
   `qcsuper.log`), non la logica di lettura degli IE RRC.
 - Un `manifest.json` con `OK: false` o `miss: true` segnala un problema
   nella cattura stessa (es. divergenza tra pcap live e pcap rigenerato
-  dal `.dlf`, vedi sezione 3 del README): va risolto/verificato prima di
-  trarre conclusioni sul contenuto MDT.
+  dal `.dlf`, vedi sezione 3 di [GUIDA_MDTCAP.md](GUIDA_MDTCAP.md)): va
+  risolto/verificato prima di trarre conclusioni sul contenuto MDT.

@@ -98,8 +98,9 @@ Nessuno di questi dati riguarda persone diverse da chi possiede il
 dispositivo e la SIM usati per il test.
 
 Con l'opzione facoltativa `--extended` (analisi aggiuntiva di indizi di
-comportamento di rete sospetto/malevolo, vedi README.md sezione
-"Controlli extra") non viene raccolto **nessun dato in più**: si limita
+comportamento di rete sospetto/malevolo, vedi
+[GUIDA_MDTCAP.md](GUIDA_MDTCAP.md) sezione "Controlli extra") non viene
+raccolto **nessun dato in più**: si limita
 ad analizzare più a fondo lo stesso traffico già catturato per il test
 MDT, producendo file di log/report aggiuntivi nella stessa cartella.
 

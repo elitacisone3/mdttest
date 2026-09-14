@@ -308,7 +308,7 @@ def screen_settings():
         updates["testPin"] = ""
         updates["testSim"] = ""
     mdtmain_config.update(**updates)
-    if disable_send == "1" and not mdtmain_config.get_bool(config, "dataDisclaim"):
+    if disable_send == "0" and not mdtmain_config.get_bool(config, "dataDisclaim"):
         mdtmain_config.update(dataDisclaim="1")
         ui.screen_msgbox(_DATA_DISCLAIM_TEXT)
 
