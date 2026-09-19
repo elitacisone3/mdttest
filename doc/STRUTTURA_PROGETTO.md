@@ -11,6 +11,9 @@ mdttest/
 ├── mdtimei                     ← cambio IMEI SPERIMENTALE, richiede autorizzazione
 │                                (vedi doc/CAMBIO_IMEI.md e
 │                                doc/GUIDA_LEGALE_IMEI.md; NON per uso ordinario)
+├── mdtauth                      ← aggiorna/verifica la chiave GPG di cifratura
+│                                evidenze (main_configs/data.pub), vedi
+│                                mdtauth --help e doc/MDTMAIN.md
 ├── mdtmain                      ← interfaccia guidata in stile raspi-config
 │                                (vedi doc/MDTMAIN.md)
 ├── install.sh                  ← verifica/installa le dipendenze
@@ -33,6 +36,9 @@ mdttest/
 │   │                                         mdtimei per un ripristino manuale)
 │   ├── imei_auth                            autorizzazione firmata GPG al cambio IMEI
 │   │                                         (usata da mdtimei, vedi src/testauth)
+│   ├── system_id                            id hardware del device, salvato da
+│   │                                         src/mdtmain_lib/autoconfig.py quando
+│   │                                         autoConfig=1 (vedi doc/MDTMAIN.md)
 │   ├── op/                                configurazioni per operatore italiano
 │   │   ├── tim.conf
 │   │   ├── vodafone.conf
@@ -53,7 +59,13 @@ mdttest/
 │   ├── server.conf                          host del server per invio dati/download
 │   │                                         certificato identità (formato key=value)
 │   ├── data.pub                             chiave GPG pubblica per cifrare le evidenze
-│   │                                         inviate durante l'invio dati/test continuato
+│   │                                         inviate durante l'invio dati/test continuato,
+│   │                                         valida solo se è la stessa chiave di
+│   │                                         src/res/auth.pub, o firmata da essa (vedi
+│   │                                         src/mdtmain_lib/gpgtrust.py e mdtauth)
+│   ├── data.pub.dist                        copia di riferimento di data.pub, usata da
+│   │                                         "mdtauth --restore" per tornare alla chiave
+│   │                                         di default
 │   └── profile/                             schedulazioni del test continuato (DSL
 │       └── Default.conf                       START/IN/EVERY/CHECKPOINT, vedi doc/MDTMAIN.md)
 ├── extra_configs/                      ← regole per src/extra_scan (--extended),
@@ -81,9 +93,12 @@ mdttest/
 │   │                              doc/GUIDA_MDTCAP.md, "Controlli extra", ed
 │   │                              extra_configs/README.md)
 │   ├── mdtmain_lib/                libreria di supporto di mdtmain (rete, HTTP,
-│   │                              evidenza, scheduler, interfaccia dialog)
+│   │                              evidenza, scheduler, verifica chiavi GPG,
+│   │                              interfaccia dialog)
 │   └── res/
 │       └── auth.pub                chiave GPG radice usata da src/testauth
+│                                    (mdtimei) e come riferimento di fiducia
+│                                    per main_configs/data.pub (vedi mdtauth)
 └── synthetic_test/       ← generatore di catture .dlf sintetiche per
     ├── gen_mdt_dlf.py           testare mdtcap senza modem/SIM/rete, vedi
     └── README.md                synthetic_test/README.md

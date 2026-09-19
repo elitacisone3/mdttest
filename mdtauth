@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""
+mdtauth — aggiorna la chiave GPG destinataria delle evidenze
+(main_configs/data.pub), verificandone la fiducia rispetto alla chiave
+radice/master (src/res/auth.pub) — la stessa verifica che mdtmain esegue
+da solo all'avvio (vedi src/mdtmain_lib/gpgtrust.py).
+
+Una chiave e' accettata come data.pub solo se e' la STESSA chiave di
+src/res/auth.pub, oppure se e' DIVERSA ma porta una firma di
+certificazione valida emessa da src/res/auth.pub (catena di fiducia a un
+solo livello, root -> chiave dati — stessa logica usata da src/testauth
+per la coppia radice/delegata).
+
+Uso:
+    mdtauth -K <id chiave>      Legge la nuova chiave dal portachiavi
+                                 GPG di chi esegue mdtauth (per key id o
+                                 fingerprint).
+    mdtauth                     Legge la nuova chiave (blocco ASCII
+                                 armor) da stdin (incollarla e poi
+                                 Ctrl-D, oppure una redirezione/pipe).
+    mdtauth --test               Verifica la chiave attualmente in
+                                 main_configs/data.pub senza chiedere
+                                 nulla e senza modificare nulla.
+    mdtauth --restore            Ripristina main_configs/data.pub dalla
+                                 copia di riferimento
+                                 main_configs/data.pub.dist, ma SOLO se
+                                 quest'ultima supera la stessa verifica
+                                 di fiducia — altrimenti main_configs/
+                                 data.pub NON viene toccato.
+
+In ogni modalita' che aggiorna/ripristina il file, main_configs/data.pub
+viene sovrascritto SOLO dopo che la nuova chiave ha superato la verifica
+di fiducia — mai prima.
+
+Uscita: exit 0 se l'operazione richiesta e' andata a buon fine (chiave
+aggiornata, ripristinata, o test superato); errore su stderr ed exit 1
+se la verifica fallisce o l'operazione non puo' essere completata; exit
+2 per uso non valido (argomenti mancanti/incompatibili).
+"""
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "src"))
+
+from mdtmain_lib import constants, gpgtrust  # noqa: E402
+
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_USAGE = 2
+
+
+class UsageError(Exception):
+    pass
+
+
+def usage():
+    return __doc__.strip()
+
+
+def parse_argv(argv):
+    opts = {"key_id": None, "restore": False, "test": False}
+    i = 0
+    n = len(argv)
+    while i < n:
+        arg = argv[i]
+        if arg in ("-h", "--help"):
+            print(usage())
+            sys.exit(EXIT_OK)
+        if arg == "-K":
+            if i + 1 >= n:
+                raise UsageError("-K richiede un id chiave GPG")
+            opts["key_id"] = argv[i + 1]
+            i += 2
+            continue
+        if arg == "--restore":
+            opts["restore"] = True
+            i += 1
+            continue
+        if arg == "--test":
+            opts["test"] = True
+            i += 1
+            continue
+        raise UsageError(f"argomento sconosciuto: {arg}")
+
+    modes = sum([opts["test"], opts["restore"], opts["key_id"] is not None])
+    if modes > 1:
+        raise UsageError("-K, --restore e --test si escludono a vicenda")
+    return opts
+
+
+def export_key_from_keyring(key_id):
+    """Esporta (in chiaro, ASCII armor) la chiave PUBBLICA key_id dal
+    portachiavi GPG di chi esegue mdtauth (nessun GNUPGHOME dedicato:
+    la chiave deve gia' essere li', stesso presupposto di "mkimei
+    --create KEYID"). Solleva GpgTrustError (non UsageError: l'id era
+    sintatticamente valido, semplicemente non e' nel portachiavi - stessa
+    distinzione di src/testauth fra UsageError e AuthError) se key_id non
+    e' trovato."""
+    proc = subprocess.run(
+        ["gpg", "--batch", "--no-tty", "--armor", "--export", key_id],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        detail = proc.stderr.decode("utf-8", "replace").strip()
+        raise gpgtrust.GpgTrustError(
+            f"chiave non trovata nel portachiavi GPG: {key_id}" + (f" ({detail})" if detail else ""))
+    return proc.stdout
+
+
+def read_key_from_stdin():
+    data = sys.stdin.buffer.read()
+    if not data.strip():
+        raise UsageError("nessuna chiave ricevuta da stdin")
+    return data
+
+
+def verify_candidate(candidate_bytes):
+    """Scrive candidate_bytes in un file temporaneo e lo verifica con la
+    stessa gpgtrust.verify_evidence_keys usata da mdtmain all'avvio
+    (auth_pubkey_file=src/res/auth.pub, data_pubkey_file=il candidato) —
+    solleva gpgtrust.GpgTrustError se non e' valido."""
+    with tempfile.NamedTemporaryFile(prefix="mdtauth-candidate-", delete=False) as f:
+        f.write(candidate_bytes)
+        tmp_path = f.name
+    try:
+        gpgtrust.verify_evidence_keys(constants.AUTH_PUBKEY_FILE, tmp_path)
+    finally:
+        os.unlink(tmp_path)
+
+
+def do_update(opts):
+    if opts["key_id"] is not None:
+        candidate_bytes = export_key_from_keyring(opts["key_id"])
+    else:
+        candidate_bytes = read_key_from_stdin()
+    verify_candidate(candidate_bytes)
+    with open(constants.DATA_PUBKEY_FILE, "wb") as f:
+        f.write(candidate_bytes)
+    print(f"mdtauth: {constants.DATA_PUBKEY_FILE} aggiornato.")
+
+
+def do_test():
+    gpgtrust.verify_evidence_keys(constants.AUTH_PUBKEY_FILE, constants.DATA_PUBKEY_FILE)
+    print(f"mdtauth: {constants.DATA_PUBKEY_FILE} valida (verificata rispetto a {constants.AUTH_PUBKEY_FILE}).")
+
+
+def do_restore():
+    if not os.path.isfile(constants.DATA_PUBKEY_DIST_FILE):
+        raise gpgtrust.GpgTrustError(f"file di default non trovato: {constants.DATA_PUBKEY_DIST_FILE}")
+    try:
+        gpgtrust.verify_evidence_keys(constants.AUTH_PUBKEY_FILE, constants.DATA_PUBKEY_DIST_FILE)
+    except gpgtrust.GpgTrustError as e:
+        raise gpgtrust.GpgTrustError(
+            f"{e} — ripristino annullato, {constants.DATA_PUBKEY_FILE} non modificato")
+    shutil.copyfile(constants.DATA_PUBKEY_DIST_FILE, constants.DATA_PUBKEY_FILE)
+    print(f"mdtauth: {constants.DATA_PUBKEY_FILE} ripristinato da {constants.DATA_PUBKEY_DIST_FILE}.")
+
+
+def main(argv):
+    try:
+        opts = parse_argv(argv)
+    except UsageError as e:
+        print(f"mdtauth: {e}", file=sys.stderr)
+        return EXIT_USAGE
+
+    try:
+        if opts["test"]:
+            do_test()
+        elif opts["restore"]:
+            do_restore()
+        else:
+            do_update(opts)
+    except UsageError as e:
+        print(f"mdtauth: {e}", file=sys.stderr)
+        return EXIT_USAGE
+    except gpgtrust.GpgTrustError as e:
+        print(f"mdtauth: {e}", file=sys.stderr)
+        return EXIT_ERROR
+    except OSError as e:
+        print(f"mdtauth: {e}", file=sys.stderr)
+        return EXIT_ERROR
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

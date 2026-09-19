@@ -27,7 +27,8 @@ def _default_capture_fn(quiet, should_stop):
 
 def run_continuous(schedule_name, mdtcap_profile_name, contract, host, sim_pin=None,
                     quiet=False, should_stop=None,
-                    now_fn=None, capture_fn=None, network_enabled=True, log_fn=None):
+                    now_fn=None, capture_fn=None, network_enabled=True, log_fn=None,
+                    send_disabled=False):
     """Ciclo principale, bloccante: torna (stop_reason, ultimo manifest o
     None) quando l'utente preme un tasto (durante una cattura o in pausa)
     per fermare il test continuo (stop_reason "user_keypress" in
@@ -53,7 +54,15 @@ def run_continuous(schedule_name, mdtcap_profile_name, contract, host, sim_pin=N
     datetime.now, capture_fn la vera runner.run_foreground_with_keypress_stop,
     network_enabled resta True, log_fn un no-op. Iniezione esplicita di
     dipendenze (mai una variabile globale mutabile), stesso spirito di
-    src/testauth."""
+    src/testauth.
+
+    send_disabled (uso di produzione, non di collaudo): True se le
+    chiavi GPG di cifratura evidenza non sono risultate valide
+    all'avvio (vedi app.run_edge_mode/gpgtrust.verify_evidence_keys) —
+    la cattura/schedulazione prosegue normalmente, ma non viene mai
+    incapsulata/inviata alcuna evidenza (package_and_push/flush_spool
+    saltate; masterlog.flush_masterlog(host), canale separato non
+    cifrato con queste chiavi, non e' influenzato)."""
     now_fn = now_fn or datetime.now
     log_fn = log_fn or (lambda msg: None)
     capture_fn = capture_fn or _default_capture_fn(quiet, should_stop)
@@ -131,7 +140,7 @@ def run_continuous(schedule_name, mdtcap_profile_name, contract, host, sim_pin=N
         _maybe_play_alarm(day_state, now_fn, log_fn)
 
         if stop_reason not in ("user_keypress", "signal"):
-            if network_enabled and manifest is not None:
+            if network_enabled and not send_disabled and manifest is not None:
                 package_and_push(manifest, outdir, contract, host, day_state, quiet=quiet)
             evidence.cleanup_old_evidence(persistent_dir)
         return stop_reason
@@ -147,7 +156,8 @@ def run_continuous(schedule_name, mdtcap_profile_name, contract, host, sim_pin=N
         # un server irraggiungibile per ore farebbe ripetere /CHECK ogni
         # pochi secondi per niente.
         if network_enabled and time.monotonic() >= next_spool_attempt:
-            flush_spool(contract, host, quiet=quiet)
+            if not send_disabled:
+                flush_spool(contract, host, quiet=quiet)
             masterlog.flush_masterlog(host)
             next_spool_attempt = time.monotonic() + SPOOL_RETRY_SECONDS
         if quiet:

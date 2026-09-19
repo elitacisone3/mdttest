@@ -139,10 +139,20 @@ le evidenze, per un monitoraggio prolungato non presidiato). Entrambe:
   mai attive di default, richiedono di inserire la SIM e confermare a
   video), e sono disponibili solo quando il Raspberry Pi ha una
   connessione a Internet propria (oltre a quella della SIM sotto test);
-- invia l'evidenza (o, quando non emergono anomalie, solo il riepilogo
-  tecnico `manifest.json`) **cifrata con GPG** verso l'host indicato in
-  `main_configs/server.conf`, scelto da chi gestisce il dispositivo,
-  non un server gestito dall'autore del progetto;
+- invia l'evidenza (o, quando non emergono anomalie né avvisi/errori
+  nella cattura stessa, solo il riepilogo tecnico `manifest.json`, vedi
+  [EVIDENZE.md](EVIDENZE.md)) **cifrata con GPG** verso l'host indicato
+  in `main_configs/server.conf`, scelto da chi gestisce il dispositivo,
+  non un server gestito dall'autore del progetto. La cifratura usa la
+  chiave dati del progetto (`main_configs/data.pub`) e, per garantire
+  che sia una chiave autorizzata e non sostituita da qualcun altro,
+  anche la chiave radice del progetto (`src/res/auth.pub`): se sono la
+  stessa chiave, come nella configurazione di default, il destinatario
+  finale è uno solo;
+- se le chiavi di cifratura non risultano valide (ad esempio
+  manomesse), l'invio viene disattivato automaticamente per l'intera
+  sessione (con un avviso a video, o solo su registro di sistema in
+  modalità `--edge-mode`), finché il problema non viene risolto;
 - conserva comunque una copia locale (o su chiavetta USB) delle
   evidenze per 7 giorni, poi le elimina automaticamente;
 - non riguarda in nessun modo i test singoli (in locale o su chiavetta

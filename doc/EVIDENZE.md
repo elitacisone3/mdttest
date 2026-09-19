@@ -138,6 +138,25 @@ in modo verificabile il device di test e l'ICCID della SIM usata, utile
 se l'evidenza deve essere associata a una specifica richiesta/pratica
 senza dover conservare l'ICCID in chiaro altrove.
 
+## Cosa viene inviato al server (invio dati/test continuato)
+
+Nelle due modalità che inviano dati (vedi [PRIVACY.md](PRIVACY.md)), non
+viene sempre trasmessa l'evidenza completa: se il test è `OK`, non ci
+sono avvisi/errori diag (`diagWarn`/`diagError` nel manifest, vedi
+sezione 4 di [GUIDA_MDTCAP.md](GUIDA_MDTCAP.md)) e non è attivo
+`--extended` con `extraLevel` diverso da `I`, viene inviato solo il
+riepilogo tecnico `manifest.json`, per limitare il traffico quando non
+c'è nulla da approfondire.
+
+In tutti gli altri casi (test non riuscito, presenza di
+`diagWarn`/`diagError` anche con test riuscito, o controlli extra con un
+livello superiore a `I`) viene inviata l'evidenza completa (pcap, dlf,
+qcsuper.log, i report testuali, ecc.). Un `diagError`, in particolare,
+può significare che un'intera categoria di traffico è mancante dal
+`.dlf` senza che `OK`/`hasMDT`/`hasRRC` se ne accorgano da soli (vedi
+sezione 3 di [GUIDA_MDTCAP.md](GUIDA_MDTCAP.md)): merita comunque
+l'evidenza intera, per poterlo diagnosticare in un secondo momento.
+
 ## Usare l'evidenza a supporto di una richiesta verso l'operatore
 
 Un operatore, se interpellato con una richiesta di accesso ai dati (es.

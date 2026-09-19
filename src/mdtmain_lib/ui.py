@@ -67,19 +67,35 @@ def request_larger_window(rows=44, cols=132):
     sys.stdout.flush()
 
 
+def _write_title(title):
+    sys.stdout.write(f"\x1b]0;{title}\x07")
+    sys.stdout.flush()
+
+
 def set_window_title(title):
     """Imposta il titolo della finestra (OSC 0), impilando prima quello
     attuale (CSI 22;0 t) cosi' restore_window_title() puo' ripristinarlo
     senza doverlo prima leggere (non affidabile su molti terminali)."""
     sys.stdout.write("\x1b[22;0t")
-    sys.stdout.write(f"\x1b]0;{title}\x07")
     sys.stdout.flush()
+    _write_title(title)
 
 
 def restore_window_title():
     """Ripristina il titolo impilato da set_window_title() (CSI 23;0 t)."""
     sys.stdout.write("\x1b[23;0t")
     sys.stdout.flush()
+
+
+def restore_window_title_with_fallback():
+    """Tenta il ripristino nativo (pop, CSI 23;0 t) e poi imposta comunque
+    il titolo sull'hostname: molti terminali (es. PuTTY, Windows Terminal)
+    ignorano in silenzio il pop, lasciando il titolo bloccato su "MDTCap"
+    - l'hostname e' un titolo sensato in entrambi i casi (dove il pop
+    funziona non c'e' un vero "titolo originale" da preservare, essendo
+    quello lo stesso stack che set_window_title() ha appena impilato)."""
+    restore_window_title()
+    _write_title(netinfo.get_hostname())
 
 
 def header_text(net_status_text=None, show_alarm=True):
@@ -138,6 +154,15 @@ def screen_menu(title, text, choices, height=0, width=0, menu_height=0):
 
 def screen_yesno(text, title=None):
     code = _d.yesno(text, **_title_kwargs(title))
+    return code == _d.OK
+
+
+def screen_okcancel(text, title=None):
+    """Come screen_yesno(), ma con le etichette esplicite "Ok"/"Cancel"
+    invece di quelle localizzate di default di dialog(1) — usata dove il
+    testo stesso della domanda non e' un si'/no (es. "continuare
+    comunque, o chiudere il programma?")."""
+    code = _d.yesno(text, yes_label="Ok", no_label="Cancel", **_title_kwargs(title))
     return code == _d.OK
 
 

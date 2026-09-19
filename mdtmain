@@ -158,6 +158,14 @@ def main(argv):
     from mdtmain_lib import edgemode
     edgemode.stop_running_instance()
 
+    # Rileva un eventuale cambio di hardware (es. scheda SD clonata su
+    # un'altra Raspberry Pi) e, se serve, forza un reset di sicurezza
+    # della configurazione (vedi autoconfig.apply()) — PRIMA di
+    # qualunque mdtmain_config.load() successivo, cosi' il resto del
+    # programma vede gia' i valori aggiornati.
+    from mdtmain_lib import autoconfig
+    autoconfig.apply()
+
     screen_mode = "--screen" in argv or edge_mode
 
     if screen_mode:
@@ -242,7 +250,7 @@ def main(argv):
         pass
     finally:
         if not screen_mode:
-            ui.restore_window_title()
+            ui.restore_window_title_with_fallback()
         # "dialog" disegna sullo schermo normale (non l'alternate screen
         # buffer): senza questo, l'ultima schermata (menu principale,
         # "Uscire da MDTCap?", ...) resta come residuo dopo l'uscita.

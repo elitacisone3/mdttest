@@ -13,9 +13,9 @@ import time
 import tty
 from datetime import datetime
 
-from . import (constants, contract, edgemode, evidence, httpclient, masterlog, mdtmain_config,
-               netconfig, netinfo, profiles, runner, screenmode, scheduler, sound, syslog_log,
-               ui, usbmount)
+from . import (constants, contract, edgemode, evidence, gpgtrust, httpclient, masterlog,
+               mdtmain_config, netconfig, netinfo, profiles, runner, screenmode, scheduler,
+               sound, syslog_log, ui, usbmount)
 
 
 _STARTUP_DISCLAIM_TEXT = """Attenzione:
@@ -45,15 +45,31 @@ def run_app(skip_network_setup=False, force_network_setup=False, auto_start=Fals
     Non chiamata da run_edge_mode() (--edge-mode e' un percorso separato,
     pensato per girare senza terminale/interazione): il disclaimer di
     avvio sotto e' quindi mostrato solo nei percorsi interattivi
-    (lancio normale, --auto-start), mai in un deployment headless."""
+    (lancio normale, --auto-start), mai in un deployment headless.
+
+    Subito dopo il disclaimer, verifica le chiavi GPG di cifratura
+    evidenza (gpgtrust.verify_evidence_keys): se non sono valide, mostra
+    una msgbox Ok/Cancel — Ok prosegue con send_disabled=True (nessun
+    invio dati per questa sessione, vedi screen_main_menu), Cancel esce
+    subito. run_edge_mode() fa la stessa verifica per conto proprio, in
+    modo silenzioso (solo syslog, vedi li')."""
     config = mdtmain_config.load()
     if not mdtmain_config.get_bool(config, "startDisclaim"):
         mdtmain_config.update(startDisclaim="1")
         ui.screen_msgbox(_STARTUP_DISCLAIM_TEXT)
+
+    send_disabled = False
+    try:
+        gpgtrust.verify_evidence_keys(constants.AUTH_PUBKEY_FILE, constants.DATA_PUBKEY_FILE)
+    except gpgtrust.GpgTrustError as e:
+        if not ui.screen_okcancel(f"Attenzione: Problema con le chiavi GPG\n{e}"):
+            return
+        send_disabled = True
+
     disable_net = mdtmain_config.get_bool(config, "disableNet")
     has_internet = netinfo.has_internet()
 
-    resumed = (auto_start and mdtmain_config.get_bool(config, "autoStart")
+    resumed = (auto_start and mdtmain_config.get_bool(config, "autoStart") and not send_disabled
                and config["testSim"] and config["mdtcapProfile"] and config["schedulerProfile"])
     if resumed:
         _resume_continuous_test(config)  # gestisce da sola il caso ICCID non corrispondente
@@ -63,7 +79,7 @@ def run_app(skip_network_setup=False, force_network_setup=False, auto_start=Fals
         has_internet = screen_network_setup()
 
     while True:
-        if not screen_main_menu(has_internet):
+        if not screen_main_menu(has_internet, send_disabled):
             return
         has_internet = netinfo.has_internet()
 
@@ -179,17 +195,22 @@ def _screen_wifi_config():
 
 # ---- menu principale ----------------------------------------------------
 
-def screen_main_menu(has_internet):
+def screen_main_menu(has_internet, send_disabled=False):
+    """send_disabled: True se all'avvio (run_app) la verifica delle
+    chiavi GPG di cifratura evidenza e' fallita e l'utente ha scelto di
+    proseguire comunque (msgbox Ok/Cancel) — nasconde ogni scelta di menu
+    che invierebbe dati, in aggiunta a (non al posto di) disableSend."""
     ui.refresh_background_title(has_internet)
     config = mdtmain_config.load()
     choices = [("1", "Esegui un test in locale (senza salvare)"),
                ("2", "Esegui un test salvando le evidenze su chiavetta USB")]
     # "3"/"4" sono le uniche due modalita' che inviano dati a un server:
     # nascoste (non solo bloccate a schermata scelta) se disableSend=1
-    # (default), stesso schema gia' usato sotto per "10"-"13" (numeri
+    # (default) o se send_disabled (chiavi GPG non valide, vedi run_app),
+    # stesso schema gia' usato sotto per "10"-"13" (numeri
     # riservati/stabili, aggiunti solo se applicabile - la dispatch piu'
     # sotto non cambia).
-    if not mdtmain_config.get_bool(config, "disableSend"):
+    if not mdtmain_config.get_bool(config, "disableSend") and not send_disabled:
         choices.append(("3", "Esegui un test inviando i dati"))
         choices.append(("4", "Imposta test continuato (condividendo le evidenze)"))
     choices += [("5", "Test baseband"),
@@ -200,15 +221,19 @@ def screen_main_menu(has_internet):
     # Mostrata solo se c'e' davvero qualcosa da inviare (evidenza rimasta
     # in log/spool da un invio immediato fallito, vedi
     # scheduler.package_and_push/flush_spool): non ha senso proporla
-    # altrimenti.
-    if evidence.list_spool_files():
+    # altrimenti. Nascosta anche con send_disabled: invierebbe comunque
+    # dati, non e' condizionata da disableSend.
+    if evidence.list_spool_files() and not send_disabled:
         choices.append(("10", "Invia i dati manualmente"))
     # Mostrate solo se un test continuato e' completamente configurato
     # (stessa condizione di --auto-start/--edge-mode: testSim non basta
-    # da solo, serve anche mdtcapProfile/schedulerProfile).
+    # da solo, serve anche mdtcapProfile/schedulerProfile). Solo "12"
+    # (fa ripartire l'invio) va nascosta con send_disabled: "11"/"13"
+    # non inviano nulla.
     if config["testSim"] and config["mdtcapProfile"] and config["schedulerProfile"]:
         choices.append(("11", "Visualizza impostazioni test continuo"))
-        choices.append(("12", "Riprendi test continuo"))
+        if not send_disabled:
+            choices.append(("12", "Riprendi test continuo"))
         choices.append(("13", "Rimuovi test continuo"))
     choice = ui.screen_menu("MDTCap", "Selezionare un'operazione:", choices)
     if choice is None:
@@ -995,13 +1020,27 @@ def run_edge_mode():
 
     _ensure_gps_fix_if_needed(quiet=True)
 
+    # Nessuna UI in --edge-mode: un problema con le chiavi GPG non puo'
+    # aprire una msgbox (nessuno la vedrebbe) - viene solo loggato su
+    # syslog, e l'invio resta disabilitato per questa esecuzione del
+    # servizio (la cattura/schedulazione locale prosegue comunque, vedi
+    # scheduler.run_continuous send_disabled).
+    send_disabled = False
+    try:
+        gpgtrust.verify_evidence_keys(constants.AUTH_PUBKEY_FILE, constants.DATA_PUBKEY_FILE)
+    except gpgtrust.GpgTrustError as e:
+        syslog_log.warning(
+            f"mdtmain: --edge-mode chiave GPG non valida ({e}): invio disabilitato per questa esecuzione.")
+        send_disabled = True
+
     syslog_log.info(
         f"mdtmain: --edge-mode avvio test continuato (profilo {config['mdtcapProfile']!r}, "
         f"schedulazione {config['schedulerProfile']!r}).")
     try:
         stop_reason, manifest = scheduler.run_continuous(
             config["schedulerProfile"], config["mdtcapProfile"], contract_id, host,
-            sim_pin=config["testPin"], quiet=True, should_stop=edgemode.should_stop)
+            sim_pin=config["testPin"], quiet=True, should_stop=edgemode.should_stop,
+            send_disabled=send_disabled)
     except Exception as e:  # non deve mai morire in silenzio sotto systemd
         syslog_log.error(f"mdtmain: --edge-mode interrotto da un errore imprevisto: {e}")
         return constants.EXIT_ERROR

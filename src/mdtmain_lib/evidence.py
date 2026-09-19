@@ -11,7 +11,7 @@ import tarfile
 import tempfile
 from datetime import datetime, timedelta
 
-from . import constants
+from . import constants, gpgtrust
 
 TIMESTAMP_DIR_RE = re.compile(r"^\d{14}$")  # yyyymmddhhmmss
 
@@ -25,9 +25,18 @@ def timestamp_now():
 
 
 def should_keep_full_evidence(manifest):
-    """Regola: se il test e' OK e (non --extra o extraLevel=='I'), basta
-    conservare/inviare manifest.json. Altrimenti tutta l'evidenza."""
+    """Regola: se il test e' OK, non ci sono warning/errori diag (vedi
+    "diagWarn"/"diagError" nel manifest, calcolati da mdtcap con
+    compute_diag_warn_count()/compute_diag_error_count() sul log di
+    qcsuper) e (non --extra o extraLevel=='I'), basta conservare/inviare
+    manifest.json. Altrimenti tutta l'evidenza. Un diagError puo'
+    significare un'intera categoria di traffico mancante dal .dlf senza
+    che OK/hasMDT/hasRRC se ne accorgano (vedi doc/GUIDA_MDTCAP.md):
+    merita comunque l'evidenza completa, per poterlo diagnosticare in un
+    secondo momento."""
     if not manifest.get("OK", False):
+        return True
+    if manifest.get("diagWarn", 0) or manifest.get("diagError", 0):
         return True
     if manifest.get("extended") and manifest.get("extraLevel", "I") != "I":
         return True
@@ -51,45 +60,47 @@ def package_dir(src_dir, only_manifest, dest_path=None):
     return dest_path
 
 
-def _import_pubkey_fingerprint(gnupghome, pubkey_file):
-    with open(pubkey_file, "rb") as f:
-        key_bytes = f.read()
-    env = os.environ.copy()
-    env["GNUPGHOME"] = gnupghome
-    proc = subprocess.run(
-        ["gpg", "--batch", "--yes", "--no-tty", "--import"],
-        input=key_bytes, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
-    )
-    if proc.returncode != 0:
-        raise EvidenceError("import chiave pubblica GPG fallito: " + proc.stderr.decode(errors="replace").strip())
-    proc = subprocess.run(
-        ["gpg", "--batch", "--no-tty", "--with-colons", "--list-keys"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
-    )
-    for line in proc.stdout.decode(errors="replace").splitlines():
-        fields = line.split(":")
-        if fields[0] == "fpr" and len(fields) > 9 and fields[9]:
-            return fields[9]
-    raise EvidenceError(f"impossibile ricavare il fingerprint da {pubkey_file}")
-
-
-def gpg_encrypt(path_in, pubkey_file=None, path_out=None):
-    pubkey_file = pubkey_file or constants.DATA_PUBKEY_FILE
-    if not os.path.isfile(pubkey_file):
-        raise EvidenceError(f"chiave pubblica non trovata: {pubkey_file}")
+def gpg_encrypt(path_in, pubkey_files=None, path_out=None):
+    """Cifra path_in verso i destinatari di TUTTI i pubkey_files (default:
+    la chiave radice src/res/auth.pub e la chiave dati main_configs/
+    data.pub — vedi gpgtrust.verify_evidence_keys, chiamata separatamente
+    all'avvio di mdtmain per validare che queste due chiavi siano davvero
+    in relazione di fiducia). Se due file coincidono (stessa chiave),
+    gpg deduplica da solo il destinatario: nessun caso speciale serve
+    qui per il caso "solo chiave master" (stessa chiave in entrambi i
+    file)."""
+    pubkey_files = pubkey_files or [constants.AUTH_PUBKEY_FILE, constants.DATA_PUBKEY_FILE]
+    for f in pubkey_files:
+        if not os.path.isfile(f):
+            raise EvidenceError(f"chiave pubblica non trovata: {f}")
     path_out = path_out or (path_in + ".gpg")
-    with tempfile.TemporaryDirectory(prefix="mdtmain-gnupg-") as gnupghome:
-        os.chmod(gnupghome, 0o700)
-        fpr = _import_pubkey_fingerprint(gnupghome, pubkey_file)
-        env = os.environ.copy()
-        env["GNUPGHOME"] = gnupghome
-        proc = subprocess.run(
-            ["gpg", "--batch", "--yes", "--no-tty", "--trust-model", "always",
-             "--recipient", fpr, "--output", path_out, "--encrypt", path_in],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
-        )
-        if proc.returncode != 0:
-            raise EvidenceError("cifratura GPG fallita: " + proc.stderr.decode(errors="replace").strip())
+    try:
+        with tempfile.TemporaryDirectory(prefix="mdtmain-gnupg-") as gnupghome:
+            os.chmod(gnupghome, 0o700)
+            fprs = []
+            for f in pubkey_files:
+                with open(f, "rb") as fh:
+                    key_bytes = fh.read()
+                fpr = gpgtrust.key_fingerprint(key_bytes)
+                if fpr is None:
+                    raise EvidenceError(f"impossibile ricavare il fingerprint da {f}")
+                gpgtrust.import_key(gnupghome, key_bytes)
+                if fpr not in fprs:
+                    fprs.append(fpr)
+            env = os.environ.copy()
+            env["GNUPGHOME"] = gnupghome
+            recipient_args = []
+            for fpr in fprs:
+                recipient_args += ["--recipient", fpr]
+            proc = subprocess.run(
+                ["gpg", "--batch", "--yes", "--no-tty", "--trust-model", "always",
+                 *recipient_args, "--output", path_out, "--encrypt", path_in],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+            )
+            if proc.returncode != 0:
+                raise EvidenceError("cifratura GPG fallita: " + proc.stderr.decode(errors="replace").strip())
+    except gpgtrust.GpgTrustError as e:
+        raise EvidenceError(str(e))
     return path_out
 
 

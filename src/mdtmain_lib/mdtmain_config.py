@@ -57,6 +57,15 @@ assente/non valida):
                      compare il disclaimer dedicato (vedi
                      app.screen_settings) - "hai gia' accettato", non si
                      ripete.
+  autoConfig    0/1  Default 0. Se 1, confronta ad ogni avvio l'id
+                     hardware del device con quello salvato in
+                     mdt_configs/system_id (vedi
+                     src/mdtmain_lib/autoconfig.py): se diverso (o il
+                     file manca), lo aggiorna e forza disableSend=1,
+                     startDisclaim=0, dataDisclaim=0 — pensato per una
+                     scheda SD/immagine clonata su un altro device. Se
+                     0, mdt_configs/system_id viene svuotato (se non lo
+                     e' gia') e la configurazione non viene toccata.
 """
 import os
 
@@ -81,11 +90,12 @@ DEFAULTS = {
     "disableSend": "1",
     "startDisclaim": "0",
     "dataDisclaim": "0",
+    "autoConfig": "0",
 }
 
 _BOOL_KEYS = {"disableNet", "disableIMEI", "disableAlarm", "autoStart", "hdmi", "doGPSFix",
               "forceExtended", "testSMS", "alarmCheckPoint",
-              "disableSend", "startDisclaim", "dataDisclaim"}
+              "disableSend", "startDisclaim", "dataDisclaim", "autoConfig"}
 _HOUR_KEYS = {"minAlarmHour", "maxAlarmHour"}
 
 

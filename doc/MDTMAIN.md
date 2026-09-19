@@ -32,6 +32,20 @@ All'avvio, la primissima volta, compare anche un disclaimer generale sul
 programma (`startDisclaim` in `main_configs/mdtmain.conf`, vedi sotto):
 non si ripete alle esecuzioni successive.
 
+Subito dopo, verifica anche le chiavi GPG usate per cifrare le evidenze:
+`main_configs/data.pub` è considerata valida solo se è la stessa chiave
+di `src/res/auth.pub`, oppure se è diversa ma firmata da essa (vedi
+[doc/STRUTTURA_PROGETTO.md](STRUTTURA_PROGETTO.md) e `mdtauth --help`
+per come aggiornarla/verificarla). Se qualcosa non va, compare una
+finestra "Attenzione: Problema con le chiavi GPG" con il dettaglio
+dell'errore e due pulsanti: **Ok** prosegue, ma senza alcun invio dati
+per questa sessione (nasconde le voci di menu 3/4/10/12, vedi sotto);
+**Cancel** chiude subito il programma, senza altre domande. In modalità
+`--edge-mode` lo stesso controllo avviene in modo silenzioso: l'eventuale
+problema resta solo su registro di sistema (syslog) e l'invio è
+disattivato per quell'esecuzione del servizio, che comunque prosegue
+normalmente per il resto (cattura/schedulazione locale).
+
 Il menu principale offre **sempre** tutte le opzioni seguenti,
 indipendentemente dalla connessione a Internet (le modalità che la
 richiedono davvero segnalano l'errore solo se effettivamente provano a
@@ -108,6 +122,7 @@ stesso (schermata "Impostazioni", "Imposta test continuato"):
 | `disableSend` | `1` | se `1` (default), nasconde dal menu principale "Esegui un test inviando i dati"/"Imposta test continuato" (le uniche due modalità che inviano dati a un server, vedi [doc/PRIVACY.md](PRIVACY.md)); attivandolo da Impostazioni cancella anche `testPin`/`testSim` |
 | `startDisclaim` | `0` | diventa `1` dopo il primo avvio, quando compare il disclaimer generale del programma; non si ripete |
 | `dataDisclaim` | `0` | diventa `1` la prima volta che si tocca `disableSend` dalla schermata Impostazioni, quando compare il disclaimer sull'invio dati; non si ripete |
+| `autoConfig` | `0` | se `1`, confronta a ogni avvio l'id hardware del device con quello salvato in `mdt_configs/system_id`: se diverso (o il file manca), aggiorna quel file e forza `disableSend=1`, `startDisclaim=0`, `dataDisclaim=0`, pensato per il caso di una scheda SD o un'immagine clonata su un altro device; se `0`, il file `mdt_configs/system_id` viene svuotato (se non lo è già) e la configurazione non viene toccata |
 
 ### Modalità a schermo intero (`--screen`)
 

@@ -19,6 +19,8 @@ RES_DIR = os.path.join(SRC_DIR, "res")
 
 SERVER_CONF_FILE = os.path.join(MAIN_CONFIGS_DIR, "server.conf")
 DATA_PUBKEY_FILE = os.path.join(MAIN_CONFIGS_DIR, "data.pub")
+DATA_PUBKEY_DIST_FILE = os.path.join(MAIN_CONFIGS_DIR, "data.pub.dist")
+AUTH_PUBKEY_FILE = os.path.join(RES_DIR, "auth.pub")
 CONTINUOUS_SCHEDULE_DIR = os.path.join(MAIN_CONFIGS_DIR, "profile")
 MDTMAIN_CONF_FILE = os.path.join(MAIN_CONFIGS_DIR, "mdtmain.conf")
 
@@ -36,6 +38,7 @@ MDTCAP_SPLASH_PNG = os.path.join(RES_DIR, "mdtcap.png")
 
 MDTCAP_PROFILE_DIR = os.path.join(MDT_CONFIGS_DIR, "profile")
 IMEI_AUTH_FILE = os.path.join(MDT_CONFIGS_DIR, "imei_auth")
+SYSTEM_ID_FILE = os.path.join(MDT_CONFIGS_DIR, "system_id")
 
 # Directory di stato --shm (tmpfs), una per modalita' cosi' non si
 # mescolano mai i file di stato di test diversi lanciati in sequenza.
