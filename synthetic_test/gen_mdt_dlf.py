@@ -61,6 +61,15 @@ Scenari disponibili (--scenario):
                    nessun effetto).
   testsms-all      Come sopra, token ALL____: tutte e 5 le categorie=A.
 
+  Scenario per l'esito della sessione (src/coverage_report.py, sempre attivo):
+  coverage-idle-cycle  SIB1, due connessioni RRC complete (Setup ->
+                   SetupComplete -> NAS in entrambi i versi -> Release) con
+                   una fase idle di 5 minuti in mezzo, nessun indicatore MDT.
+                   Atteso: esito=non_rilevato (cattura in grado di vedere,
+                   nulla di rilevato). Per non_verificabile si usa
+                   nasid-identity-imsi (solo NAS, nessun record RRC); per
+                   rilevato lo scenario full.
+
 Uso:
     python3 gen_mdt_dlf.py [opzioni]
     python3 gen_mdt_dlf.py --scenario r17-only -o r17_only.dlf
@@ -75,6 +84,7 @@ from datetime import datetime, timedelta, timezone
 from struct import pack
 
 from pycrate_asn1dir.RRCLTE import EUTRA_RRC_Definitions as D
+from pycrate_asn1dir import LPP
 from pycrate_mobile import TS24301_EMM as EMM
 from pycrate_mobile import TS23040_SMS as SMS
 
@@ -86,6 +96,7 @@ LOG_LTE_RRC_OTA_MSG_LOG_C = 0xB0C0
 LOG_LTE_NAS_EMM_OTA_IN_MSG_LOG_C = 0xB0EC
 LOG_LTE_NAS_EMM_OTA_OUT_MSG_LOG_C = 0xB0ED
 
+LTE_BCCH_DL_SCH_v0 = 2
 LTE_DL_CCCH_v0 = 5
 LTE_DL_DCCH_v0 = 6
 LTE_UL_CCCH_v0 = 7
@@ -97,6 +108,12 @@ SCENARIOS = (
     "nasid-identity-imsi", "nasid-guti-realloc-frequent", "smsstk-silent-sms",
     "testsms-rrcciph", "testsms-cellsys", "testsms-wcdma3g", "testsms-nasid",
     "testsms-smsstk", "testsms-all",
+    # gruppo mdtcap --full-scan (src/extra_scan --set full)
+    "fullscan-obtain-location", "fullscan-mobility-history",
+    "fullscan-log-meas-available", "fullscan-lpp-request",
+    "fullscan-measconfig", "fullscan-uecap",
+    # esito della sessione (src/coverage_report.py)
+    "coverage-idle-cycle",
 )
 
 # Token esatti a 7 caratteri attesi da src/extra_scan:TEST_SMS_CATEGORY_TOKENS/
@@ -407,6 +424,176 @@ def build_nas_dl_transport_with_sms(tpdu_bytes):
     return d.to_bytes()
 
 
+# ---- gruppo --full-scan (src/extra_scan --set full) ------------------
+# Strutture verificate con pycrate (set_val + to_uper, e from_uper di
+# ritorno per la UE capability).
+
+def _uper(msg, val):
+    msg.set_val(val)
+    buf = msg.to_uper()
+    msg.reset_val()
+    return buf
+
+
+def build_reconfiguration_obtain_location():
+    """RRCConnectionReconfiguration con otherConfig-r9 ->
+    obtainLocationConfig-r11 (obtainLocation-r11 ENUMERATED {setup}): la
+    rete chiede all'UE di attivare il GNSS. Atteso: MDTExt.obtain_location."""
+    return _uper(D.DL_DCCH_Message, {'message': ('c1', ('rrcConnectionReconfiguration', {
+        'rrc-TransactionIdentifier': 1,
+        'criticalExtensions': ('c1', ('rrcConnectionReconfiguration-r8', {
+            'nonCriticalExtension': {'nonCriticalExtension': {
+                'otherConfig-r9': {'obtainLocationConfig-r11': {'obtainLocation-r11': 'setup'}}}}}))}))})
+
+
+def build_ue_information_request_mobility_history():
+    """UEInformationRequest con logMeasReportReq-r10 (v1020) e
+    mobilityHistoryReportReq-r12 (v1250, via v1130). Atteso:
+    MDTExt.mobility_history_req (e le metriche MDT gia' esistenti per
+    logMeasReportReq)."""
+    return _uper(D.DL_DCCH_Message, {'message': ('c1', ('ueInformationRequest-r9', {
+        'rrc-TransactionIdentifier': 1,
+        'criticalExtensions': ('c1', ('ueInformationRequest-r9', {
+            'rach-ReportReq-r9': False, 'rlf-ReportReq-r9': False,
+            'nonCriticalExtension': {'nonCriticalExtension': {
+                'logMeasReportReq-r10': 'true',
+                'nonCriticalExtension': {'nonCriticalExtension': {
+                    'mobilityHistoryReportReq-r12': 'true'}}}}}))}))})
+
+
+def build_setup_complete_log_meas_available():
+    """RRCConnectionSetupComplete con logMeasAvailable-r10 (v1020, via
+    v8a0). Atteso: MDTExt.log_meas_available."""
+    return _uper(D.UL_DCCH_Message, {'message': ('c1', ('rrcConnectionSetupComplete', {
+        'rrc-TransactionIdentifier': 0,
+        'criticalExtensions': ('c1', ('rrcConnectionSetupComplete-r8', {
+            'selectedPLMN-Identity': 1, 'dedicatedInfoNAS': b'\x07\x41',
+            'nonCriticalExtension': {'nonCriticalExtension': {
+                'logMeasAvailable-r10': 'true'}}}))}))})
+
+
+def build_nas_dl_generic_transport_lpp_request():
+    """NAS EMM Downlink Generic NAS Transport (0x68), contenitore di tipo 1
+    (LPP) con un LPP RequestLocationInformation (locationEstimateRequired).
+    Atteso: LPP.location_request e LPP.container."""
+    lpp_msg = LPP.LPP_PDU_Definitions.LPP_Message
+    lpp = _uper(lpp_msg, {
+        'transactionID': {'initiator': 'locationServer', 'transactionNumber': 1},
+        'endTransaction': False, 'sequenceNumber': 1,
+        'lpp-MessageBody': ('c1', ('requestLocationInformation', {
+            'criticalExtensions': ('c1', ('requestLocationInformation-r9', {
+                'commonIEsRequestLocationInformation': {
+                    'locationInformationType': 'locationEstimateRequired'}}))}))})
+    d = EMM.EMMDLGenericNASTransport()
+    d.set_val({'GenericContType': {'V': 1}, 'GenericContainer': {'V': lpp}})
+    return d.to_bytes()
+
+
+def build_reconfiguration_dense_measconfig():
+    """RRCConnectionReconfiguration con una reportConfig PERIODICA fitta
+    (reportStrongestCells, ogni 240 ms, infinity, 8 celle) che chiede anche
+    la posizione (includeLocationInfo-r10). Atteso: MeasCfg.
+    periodic_report_config, MDTExt.location_in_measconfig; con un
+    periodic_cell_gps_decoded.csv "fermo" anche
+    MeasCfg.dense_periodic_stationary."""
+    return _uper(D.DL_DCCH_Message, {'message': ('c1', ('rrcConnectionReconfiguration', {
+        'rrc-TransactionIdentifier': 2,
+        'criticalExtensions': ('c1', ('rrcConnectionReconfiguration-r8', {
+            'measConfig': {'reportConfigToAddModList': [{
+                'reportConfigId': 1,
+                'reportConfig': ('reportConfigEUTRA', {
+                    'triggerType': ('periodical', {'purpose': 'reportStrongestCells'}),
+                    'triggerQuantity': 'rsrp', 'reportQuantity': 'both',
+                    'maxReportCells': 8, 'reportInterval': 'ms240',
+                    'reportAmount': 'infinity',
+                    'includeLocationInfo-r10': 'true'})}]}}))}))})
+
+
+def build_measurement_report():
+    return _uper(D.UL_DCCH_Message, {'message': ('c1', ('measurementReport', {
+        'criticalExtensions': ('c1', ('measurementReport-r8', {
+            'measResults': {'measId': 1, 'measResultPCell': {'rsrpResult': 50, 'rsrqResult': 20}}}))}))})
+
+
+def build_ue_capability_information_mdt():
+    """UECapabilityInformation con una UE-EUTRA-Capability rel10 che
+    dichiara ue-BasedNetwPerfMeasParameters-r10 (loggedMeasurementsIdle-r10,
+    standaloneGNSS-Location-r10), catena v920 -> v940 -> v1020. Atteso:
+    UECap.mdt_capable."""
+    rohc = {k + '-r15': False for k in ('profile0x0001', 'profile0x0002', 'profile0x0003',
+                                        'profile0x0004', 'profile0x0006', 'profile0x0101',
+                                        'profile0x0102', 'profile0x0103', 'profile0x0104')}
+    cap = _uper(D.UE_EUTRA_Capability, {
+        'accessStratumRelease': 'rel10', 'ue-Category': 4,
+        'pdcp-Parameters': {'supportedROHC-Profiles': rohc},
+        'phyLayerParameters': {'ue-TxAntennaSelectionSupported': False,
+                               'ue-SpecificRefSigsSupported': False},
+        'rf-Parameters': {'supportedBandListEUTRA': [{'bandEUTRA': 20, 'halfDuplex': False}]},
+        'measParameters': {'bandListEUTRA': [{'interFreqBandList': [{'interFreqNeedForGaps': True}]}]},
+        'interRAT-Parameters': {},
+        'nonCriticalExtension': {
+            'phyLayerParameters-v920': {}, 'interRAT-ParametersGERAN-v920': {},
+            'csg-ProximityIndicationParameters-r9': {}, 'neighCellSI-AcquisitionParameters-r9': {},
+            'son-Parameters-r9': {},
+            'nonCriticalExtension': {'nonCriticalExtension': {
+                'ue-BasedNetwPerfMeasParameters-r10': {
+                    'loggedMeasurementsIdle-r10': 'supported',
+                    'standaloneGNSS-Location-r10': 'supported'}}}}})
+    return _uper(D.UL_DCCH_Message, {'message': ('c1', ('ueCapabilityInformation', {
+        'rrc-TransactionIdentifier': 1,
+        'criticalExtensions': ('c1', ('ueCapabilityInformation-r8', {
+            'ue-CapabilityRAT-ContainerList': [{'rat-Type': 'eutra', 'ueCapabilityRAT-Container': cap}]}))}))})
+
+
+def build_sib1(mcc, mnc, tac=0x1234, cell_identity=0x00ABCDE):
+    """SystemInformationBlockType1 (BCCH-DL-SCH) con un solo PLMN: da qui
+    src/coverage_report.py legge cellIdentity, TAC e PLMN della cella."""
+    return _uper(D.BCCH_DL_SCH_Message, {'message': ('c1', ('systemInformationBlockType1', {
+        'cellAccessRelatedInfo': {
+            'plmn-IdentityList': [{'plmn-Identity': mcc_mnc(mcc, mnc),
+                                   'cellReservedForOperatorUse': 'notReserved'}],
+            'trackingAreaCode': (tac, 16), 'cellIdentity': (cell_identity, 28),
+            'cellBarred': 'notBarred', 'intraFreqReselection': 'allowed', 'csg-Indication': False},
+        'cellSelectionInfo': {'q-RxLevMin': -60}, 'freqBandIndicator': 20,
+        'schedulingInfoList': [{'si-Periodicity': 'rf16', 'sib-MappingInfo': []}],
+        'si-WindowLength': 'ms10', 'systemInfoValueTag': 0}))})
+
+
+def build_rrc_connection_setup():
+    """RRCConnectionSetup (DL-CCCH) minimo: inizio di una connessione RRC."""
+    return _uper(D.DL_CCCH_Message, {'message': ('c1', ('rrcConnectionSetup', {
+        'rrc-TransactionIdentifier': 0,
+        'criticalExtensions': ('c1', ('rrcConnectionSetup-r8', {
+            'radioResourceConfigDedicated': {}}))}))})
+
+
+def build_rrc_connection_setup_complete():
+    """RRCConnectionSetupComplete (UL-DCCH) senza estensioni, con un NAS
+    Service Request (security header 12, KSI/seq e short MAC a zero) come
+    dedicatedInfoNAS."""
+    return _uper(D.UL_DCCH_Message, {'message': ('c1', ('rrcConnectionSetupComplete', {
+        'rrc-TransactionIdentifier': 0,
+        'criticalExtensions': ('c1', ('rrcConnectionSetupComplete-r8', {
+            'selectedPLMN-Identity': 1, 'dedicatedInfoNAS': b'\xc7\x00\x00\x00'}))}))})
+
+
+def build_rrc_connection_release():
+    """RRCConnectionRelease (DL-DCCH) semplice, senza redirect: fine della
+    connessione, l'UE torna in idle."""
+    return _uper(D.DL_DCCH_Message, {'message': ('c1', ('rrcConnectionRelease', {
+        'rrc-TransactionIdentifier': 1,
+        'criticalExtensions': ('c1', ('rrcConnectionRelease-r8', {
+            'releaseCause': 'other'}))}))})
+
+
+# NAS EMM Information (0x61), senza IE opzionali: messaggio innocuo
+# rete->UE, non intercettato da nessuna regola di extra_scan.
+NAS_EMM_INFORMATION = bytes([0x07, 0x61])
+# NAS EMM Status (0x60) con causa 0x6F (protocol error, unspecified): messaggio
+# UE->rete usato solo per avere traffico NAS in uscita (0xB0ED).
+NAS_EMM_STATUS = bytes([0x07, 0x60, 0x6F])
+
+
 def diag_nas_frame(nas_bytes, rrc_rel=9, rrc_ver_minor=0, rrc_ver_major=0):
     """
     Payload del frame diag LOG_LTE_NAS_EMM_OTA_IN/OUT_MSG_LOG_C (0xb0ec/
@@ -580,6 +767,44 @@ def build_records(args):
         dcs_general = {'Group': 0, 'Charset': 0, 'Class': 0}
         tpdu = build_sms_deliver_tpdu(text, dcs_general)
         records.append((NAS_IN, diag_nas_frame(build_nas_dl_transport_with_sms(tpdu)), t))
+
+    elif args.scenario == "fullscan-obtain-location":
+        records.append((RRC, diag_log_frame(build_reconfiguration_obtain_location(), LTE_DL_DCCH_v0), t))
+
+    elif args.scenario == "fullscan-mobility-history":
+        records.append((RRC, diag_log_frame(build_ue_information_request_mobility_history(), LTE_DL_DCCH_v0), t))
+
+    elif args.scenario == "fullscan-log-meas-available":
+        records.append((RRC, diag_log_frame(build_setup_complete_log_meas_available(), LTE_UL_DCCH_v0), t))
+
+    elif args.scenario == "fullscan-lpp-request":
+        records.append((NAS_IN, diag_nas_frame(build_nas_dl_generic_transport_lpp_request()), t))
+
+    elif args.scenario == "fullscan-measconfig":
+        records.append((RRC, diag_log_frame(build_reconfiguration_dense_measconfig(), LTE_DL_DCCH_v0), t))
+        # 10 measurement report nello stesso minuto: oltre la soglia di
+        # default di MeasCfg.report_rate_stationary (6/min)
+        for i in range(10):
+            records.append((RRC, diag_log_frame(build_measurement_report(), LTE_UL_DCCH_v0),
+                            t + timedelta(seconds=1 + i * 3)))
+
+    elif args.scenario == "fullscan-uecap":
+        records.append((RRC, diag_log_frame(build_ue_capability_information_mdt(), LTE_UL_DCCH_v0), t))
+
+    elif args.scenario == "coverage-idle-cycle":
+        NAS_OUT = LOG_LTE_NAS_EMM_OTA_OUT_MSG_LOG_C
+        sib1 = build_sib1(args.mcc, args.mnc)
+        # due connessioni (a t e a t+320s) separate da una fase idle di
+        # ~5 minuti, piu' una SIB1 finale a t+400s: durata ~400s
+        for start in (0, 320):
+            base = t + timedelta(seconds=start)
+            records.append((RRC, diag_log_frame(sib1, LTE_BCCH_DL_SCH_v0), base))
+            records.append((RRC, diag_log_frame(build_rrc_connection_setup(), LTE_DL_CCCH_v0), base + timedelta(seconds=1)))
+            records.append((RRC, diag_log_frame(build_rrc_connection_setup_complete(), LTE_UL_DCCH_v0), base + timedelta(seconds=2)))
+            records.append((NAS_OUT, diag_nas_frame(NAS_EMM_STATUS), base + timedelta(seconds=3)))
+            records.append((NAS_IN, diag_nas_frame(NAS_EMM_INFORMATION), base + timedelta(seconds=4)))
+            records.append((RRC, diag_log_frame(build_rrc_connection_release(), LTE_DL_DCCH_v0), base + timedelta(seconds=20)))
+        records.append((RRC, diag_log_frame(sib1, LTE_BCCH_DL_SCH_v0), t + timedelta(seconds=400)))
 
     else:
         raise AssertionError(f"scenario sconosciuto: {args.scenario}")

@@ -23,11 +23,13 @@
 #       [-v | --verbose] [--verbose-interval SECONDS] [--tui [--mdt-led]] \
 #       [--apn APN] [--force-lte] \
 #       [--reconnect-interval SECONDS [--reconnects N]] \
+#       [--idle-cycle SECONDS [--idle-cycle-host HOST]] [--gnss-off] \
 #       [--op OPERATORE] [--profile PROFILO] [--config FILE] \
 #       [--report] [--beep] \
 #       [--parla-chiaro] [--no-banner] [--shm /dev/shm/mdtcap] \
 #       [--autodetect [--autodetect-vendor STRINGA] [--autodetect-model STRINGA]] \
 #       [--usb-modem [--usb-modem-vid VID --usb-modem-pid PID]] \
+#       [--full-diag-log] [--full-scan] [--self-test] \
 #       [--extended [--ext-profile NOME]] [--test-sms]
 #
 #   sudo ./mdtcap --autodetect --qcsuper /path/to/qcsuper.py \
@@ -234,7 +236,9 @@
 #   (AT+CNMP=38, cosi' non ripiega piu' automaticamente su altri RAT) e
 #   cicla il radio (AT+CFUN=0 poi AT+CFUN=1) per forzare un nuovo tentativo
 #   di attach. Il ciclo CFUN richiede di norma un nuovo sblocco PIN, che
-#   viene ritentato automaticamente se e' stato passato --sim-pin. A fine
+#   viene ritentato automaticamente se e' stato passato --sim-pin; poi
+#   attende fino a 60s la registrazione di rete (AT+CEREG?/AT+CREG?, vedi
+#   radio_cycle()) e ne logga l'esito. A fine
 #   cattura il modo di rete viene ripristinato su automatico (AT+CNMP=2),
 #   per non lasciare il modem forzato in LTE-only oltre la sessione di
 #   test (rischio di restare senza servizio se la copertura LTE cala).
@@ -263,16 +267,22 @@
 #   AT+CFUN=1, stessa procedura di --force-lte, incluso il ritentativo del
 #   PIN se serve) forzando un nuovo attach, SENZA mai fermare/riavviare
 #   qcsuper: la cattura resta continua e unica, con dentro tutti gli
-#   eventi di riconnessione verificatisi. Indipendente da --force-lte
+#   eventi di riconnessione verificatisi. Dopo ogni ciclo attende fino a
+#   60s la registrazione di rete (AT+CEREG? stat 1/5, in subordine
+#   AT+CREG?) invece di una pausa fissa, e ne registra l'esito
+#   (registrato/registrato_non_lte/non_registrato, secondi, +CPSI) in
+#   session.log e in reconnects.csv. Se la cattura termina a meta' di un
+#   ciclo, finalize() riaccende la radio (AT+CFUN=1) e ripete il PIN.
+#   Indipendente da --force-lte
 #   (funziona anche da solo, ciclando sul RAT che la rete assegna
 #   automaticamente). Il conteggio del tempo usa la stessa granularita' di
 #   --gps-interval (default 30s): il ciclo scatta al primo giro utile
 #   dopo che sono trascorsi almeno SECONDS secondi dal precedente, non
 #   esattamente al secondo. Un valore troppo basso (sotto ai ~15-20s che
-#   il solo ciclo CFUN+assestamento richiede) produce un avviso ma non
+#   il solo ciclo CFUN+registrazione richiede) produce un avviso ma non
 #   viene bloccato. Con --tui compare come voce "Test riconnessione" (solo
-#   se questa opzione e' attiva), che riporta il numero di cicli
-#   completati e l'ultimo stato di rete osservato. Per default (senza
+#   se questa opzione e' attiva), che riporta i cicli riusciti/falliti e
+#   l'ultimo esito (giallo se l'ultimo ciclo non si e' registrato). Per default (senza
 #   --reconnect-interval) questo test NON viene mai eseguito: nessun
 #   ciclo radio aggiuntivo oltre a quello eventuale di --force-lte.
 #
@@ -475,6 +485,22 @@
 #                                              la richiesta esplicita della
 #                                              rete in se' il segnale
 #                                              rilevante
+#     "Occhio: la rete sta raccogliendo misure su di te, per ora senza posizione."
+#                                              nessuno dei casi sopra, ma
+#                                              l'esito della sessione e'
+#                                              rilevato (vedi "Esito e
+#                                              copertura"): ad esempio la
+#                                              sola configurazione MDT, o
+#                                              MDTExt/LPP ad A con
+#                                              --full-scan
+#     "Non lo so: questo test non poteva vedere le richieste della rete."
+#                                              nessuno dei casi sopra, ma
+#                                              l'esito della sessione e'
+#                                              non_verificabile (vedi
+#                                              "Esito e copertura"): la
+#                                              cattura era cieca, un
+#                                              "Tutto bene." sarebbe un
+#                                              falso rassicurante
 #     "Tutto bene."                           altrimenti (nessuna
 #                                              coordinata GPS richiesta o
 #                                              inviata)
@@ -594,6 +620,9 @@
 #                          (NON un booleano 0/1, vedi diagWarn sopra)
 #     warnPosD/warnPosL/warnMDTD/warnMDTL stessi interi (NON booleani) dei
 #                          campi omonimi di manifest.json, vedi sopra
+#     esito    "rilevato", "non_rilevato" o "non_verificabile": lo stesso
+#                          campo "esito" di manifest.json (vedi "Esito e
+#                          copertura"); assente se non calcolato
 #   "mdtStop" e' l'UNICO file scritto da un altro processo e LETTO da
 #   mdtcap (tutti gli altri sopra sono output, mai riletti): se compare
 #   in DIR durante "Cattura in corso" (controllato una volta al secondo,
@@ -722,6 +751,106 @@
 #   trarne una conclusione definitiva su quale modalita' sia preferibile
 #   in generale.
 #
+# --full-diag-log: abilita sul modem TUTTI i log code DIAG durante la
+#   cattura, come facevano le versioni precedenti. Per default mdtcap
+#   avvia qcsuper tramite src/qcsuper_run.py, che limita il .dlf agli
+#   stessi log di protocollo gia' usati per il .pcap (RRC 2G/3G/4G/5G,
+#   NAS 3G/4G: 0xB0C0, 0xB0E2/E3, 0xB0EC/ED, 0x512F, 0x412F, 0x713A,
+#   0x5226, 0xB821). Motivo, misurato su SIM7600E-H + Raspberry Pi 3:
+#   "qcsuper --dlf-dump" da solo abilita tutti i log di tutti i
+#   sottosistemi (~250 record/s, di cui solo lo 0,03% RRC), qcsuper
+#   satura un core di CPU e perde a monte, senza alcun avviso, proprio le
+#   raffiche di messaggi di un attach/riaggancio. Nessuna analisi di
+#   mdtcap usa i log fisici/di sistema esclusi. Da usare solo per
+#   diagnostica, sapendo che la cattura RRC/NAS sara' meno completa.
+#   Se qcsuper non si chiude entro 15s ed e' terminato con SIGKILL, la
+#   maschera di log resta attiva sul modem: mdtcap la azzera subito
+#   (src/diag_mask_reset.py) e, se non ci riesce o se e' lui stesso a
+#   essere terminato, lascia il marcatore /run/mdtcap_diag_dirty che fa
+#   ripetere il reset all'avvio della cattura successiva. La modalita'
+#   usata e' registrata nel manifest.json (campo "diagMask":
+#   "protocol" o "full").
+#
+# --idle-cycle SECONDS: ogni SECONDS secondi durante la cattura riporta
+#   l'UE da idle a connected SENZA detach, con un singolo ping (AT+CPING
+#   del SIM7600, 32 byte) verso --idle-cycle-host (default 8.8.8.8) sul
+#   contesto PDP 1 (riattivato se necessario); il ritorno in idle e'
+#   lasciato al timer di inattivita' della rete. Pensato per il Logged MDT,
+#   che si configura in connected, si misura in idle e viene recuperato
+#   alla riconnessione: i cicli di --reconnect-interval/--force-lte fanno
+#   invece un detach (AT+CFUN), dopo il quale l'UE puo' scartare la
+#   configurazione e i log. Servono quindi fasi idle di durata adeguata:
+#   sotto i 60s viene stampato un avviso. Ogni ciclo e' registrato in
+#   session.log e idle_cycles.csv; il valore va nel manifest.json
+#   ("idleCycle"). Usabile insieme a --reconnect-interval. Nota: genera un
+#   minimo traffico dati (un ping per ciclo) verso l'host indicato.
+#
+# --gnss-off: spegne il GNSS del modulo (AT+CGPS=0) per tutta la cattura,
+#   anche se era rimasto acceso da una sessione precedente, e ha la
+#   precedenza su --gps/--gps-wait. Serve a confrontare il comportamento
+#   della rete con GNSS acceso e spento (la posizione GNSS viene inclusa
+#   nei report MDT solo se disponibile). Lo stato del GNSS durante la
+#   cattura e' sempre registrato nel manifest.json ("gnss": on/off/unknown).
+#
+# --self-test: subito dopo l'avvio di qcsuper forza un riaggancio (ciclo
+#   radio AT+CFUN=0/1, come --force-lte/--reconnect-interval) e verifica
+#   che nel .dlf compaiano entro 30s nuovi record LTE RRC OTA (0xB0C0) e
+#   NAS EMM OTA (0xB0EC/0xB0ED). Serve a riconoscere le sessioni "cieche":
+#   alcuni firmware filtrano o troncano dei log code, oppure la maschera
+#   DIAG non viene abilitata. Se il self-test fallisce la cattura prosegue
+#   (non blocca mai, es. --edge-mode), ma l'esito e' registrato in log, TUI
+#   e manifest.json ("selfTest": {"result": "ok"|"fail", "note": ...}).
+#   Solo catture live; costa un detach/attach in piu' a inizio sessione.
+#
+# --full-scan: scansione completa, indipendente da --extended (che resta
+#   invariato e puo' essere usato insieme). Esegue src/extra_scan --set
+#   full con le regole di extra_configs/full_scan.conf (poi op/profilo,
+#   come --extended; --ext-profile vale per entrambi). Categorie:
+#     MDTExt  obtainLocationConfig-r11 (la rete chiede di attivare il
+#             GNSS), mobilityHistoryReportReq-r12/mobilityHistoryReport-r12
+#             (storico celle/tempi), logMeasAvailable (l'UE ha misure Logged
+#             MDT da consegnare), includeLocationInfo in una reportConfig
+#     LPP     sessioni di posizionamento LPP dentro i Generic NAS Transport
+#             (Request/ProvideLocationInformation, RequestCapabilities)
+#     MeasCfg ogni reportConfig ricevuta (meas_config.csv) e, a terminale
+#             FERMO, reporting periodico fitto o measurement report
+#             frequenti: un INDICATORE, non una prova
+#     UECap   UECapabilityInformation inviata (ue_capability.txt): impronta,
+#             supporto Logged MDT/GNSS dichiarato, confronto con la
+#             sessione precedente dello stesso IMEI (log/ue_capability/,
+#             aggiornato solo nelle catture live)
+#   Risultati: sezione "Scansione completa:" in TUI e report_finale.txt,
+#   full_scan_report.txt/full_scan.log/full_scan_<CAT>.log, campi
+#   "full"/"fullLevel"/"fullScanCat" nel manifest.json e, con --shm,
+#   fullLevel e full_<CAT>_L/_N.
+#
+# Esito e copertura (sempre attivi, nessuna opzione): a fine analisi
+#   src/coverage_report.py distingue "la rete non ha chiesto nulla" da "il
+#   test non era in grado di vederlo" e assegna alla sessione un esito:
+#     rilevato          almeno un indicatore forte: metriche MDT (le stesse
+#                       di --report: messaggi MDT, risposte MDT dell'UE,
+#                       logMeasReportReq) o, con --full-scan, MDTExt/LPP a
+#                       livello A. Vale anche se la cattura era in parte
+#                       cieca
+#     non_verificabile  nessun indicatore e cattura cieca: nessun record LTE
+#                       RRC OTA (0xB0C0) o NAS OTA nel .dlf, abilitazione dei
+#                       log fallita (timeout di DIAG_LOG_CONFIG_F in
+#                       qcsuper.log), self-test fallito, durata sotto i 120s,
+#                       nessuna connessione RRC osservata
+#     non_rilevato      tutto il resto
+#   Il report di copertura (coverage_report.txt) elenca i log code ricevuti
+#   con i conteggi, gli intervalli senza record DIAG oltre 60s, i frame
+#   scartati, gli errori e i timeout di qcsuper.log, RAT e celle (campioni
+#   periodici e SIB1), gli stati RRC attraversati (connessioni, rilasci,
+#   cicli connected -> idle -> connected e durata delle fasi idle), le
+#   capability dichiarate dall'UE, GNSS, mobilita' e self-test. Le
+#   limitazioni che non cambiano l'esito (nessun ciclo idle completo, frame
+#   scartati, mobilita' sconosciuta, UE che non dichiara il Logged MDT) sono
+#   elencate a parte. Risultati: riga "Esito:" e sezione "Copertura:" in
+#   report_finale.txt (con --report), riga "Esito e copertura" in TUI, frase
+#   di --parla-chiaro, campi "esito"/"esitoMotivi"/"coverage" nel
+#   manifest.json e, con --shm, il file esito.
+#
 # --usb-modem-vid VID / --usb-modem-pid PID: il VID/PID USB usato da
 #   --usb-modem sopra (4 cifre esadecimali ciascuno, es. "1e0e"/"9000" —
 #   le stesse mostrate da "lsusb"). Di norma non vanno passati a mano:
@@ -817,6 +946,7 @@ QCSUPER_BIN="${QCSUPER_BIN:-}"
 DIAG_PORT=""
 AT_PORT=""
 USB_MODEM_MODE=0
+FULL_DIAG_LOG=0
 USB_MODEM_VID=""
 USB_MODEM_PID=""
 OUTDIR=""
@@ -850,11 +980,23 @@ QCSUPER_WARMUP_WAIT=15
 SHM_DIR=""
 EXTENDED=0
 EXT_PROFILE=""
+FULL_SCAN=0
+SELF_TEST=0
+SELF_TEST_WAIT=30
+IDLE_CYCLE=0
+IDLE_CYCLE_HOST="8.8.8.8"
+GNSS_OFF=0
+GNSS_STATE=""
 TEST_SMS=0
 CAPTURE_START_EPOCH=""
 CAPTURE_END_EPOCH=""
 GPS_FIX_OBTAINED=0
 PLAIN_REPORT_FRASE=""
+# Esito della sessione (src/coverage_report.py, vedi compute_coverage()):
+# rilevato | non_rilevato | non_verificabile, vuoto se non calcolato.
+ESITO=""
+ESITO_MOTIVI=()
+COVERAGE_SINTESI=()
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 DECODE_SCRIPT="$SCRIPT_DIR/src/decode_mdt_location.py"
 BITSCAN_SCRIPT="$SCRIPT_DIR/src/mdt_bitscan.py"
@@ -863,6 +1005,7 @@ IMEI_FILE="$SCRIPT_DIR/mdt_configs/imei"
 MDTCONTRACT_BIN="$SCRIPT_DIR/mdtcontract"
 TESTAUTH_BIN="$SCRIPT_DIR/src/testauth"
 EXTRA_SCAN_SCRIPT="$SCRIPT_DIR/src/extra_scan"
+COVERAGE_SCRIPT="$SCRIPT_DIR/src/coverage_report.py"
 EXTRA_CONFIGS_DIR="$SCRIPT_DIR/extra_configs"
 
 # Filtro per l'estrazione finale degli IE MDT (loggedMeasurementConfiguration
@@ -1115,6 +1258,9 @@ tui_build_steps() {
     [[ "$REPORT" -eq 1 ]] && tui_add report "Generazione report finale"
     [[ "$PARLA_CHIARO" -eq 1 ]] && tui_add parla "Generazione parla-chiaro"
     [[ "$EXTENDED" -eq 1 ]] && tui_add extra_scan "Scansione extra (IMSI-catcher/sorveglianza)"
+    [[ "$SELF_TEST" -eq 1 && -z "$ANALYZE_DLF" && -z "$ANALYZE_PCAP" ]] && tui_add self_test "Self-test log DIAG (RRC e NAS)"
+    [[ "$FULL_SCAN" -eq 1 ]] && tui_add full_scan "Scansione completa (MDT esteso/LPP/misure/capability)"
+    tui_add coverage "Esito e copertura"
     tui_add hash "Calcolo hash SHA-256"
     tui_add manifest "Scrittura manifest"
 
@@ -1133,6 +1279,18 @@ tui_build_steps() {
         local ec
         for ec in "${EXTRA_SCAN_DEFS_ORDER[@]}"; do
             tui_add "extra_cat_$ec" "${EXTRA_SCAN_DEFS[$ec]} ($ec)"
+        done
+    fi
+
+    # "Scansione completa:" (--full-scan, vedi src/extra_scan --set full):
+    # come i controlli extra sopra, un pallino per categoria del gruppo
+    # "full", solo se --full-scan e' attivo per questa esecuzione.
+    if [[ "$FULL_SCAN" -eq 1 && ${#FULL_SCAN_DEFS_ORDER[@]} -gt 0 ]]; then
+        tui_blank
+        tui_header "Scansione completa:"
+        local fc
+        for fc in "${FULL_SCAN_DEFS_ORDER[@]}"; do
+            tui_add "full_cat_$fc" "${FULL_SCAN_DEFS[$fc]} ($fc)"
         done
     fi
 
@@ -1338,6 +1496,7 @@ tui_refresh_live_status() {
         case "$rec_status" in
             running) tui_set reconnect running "$rec_note" ;;
             ok)      tui_set reconnect ok "$rec_note" ;;
+            skip)    tui_set reconnect skip "$rec_note" ;;
         esac
     fi
     if [[ -s "$TUI_DIAG_STATUS_FILE" ]]; then
@@ -1829,6 +1988,7 @@ while [[ $# -gt 0 ]]; do
         --diag-port) DIAG_PORT="$2"; shift 2 ;;
         --at-port) AT_PORT="$2"; shift 2 ;;
         --usb-modem) USB_MODEM_MODE=1; shift ;;
+        --full-diag-log) FULL_DIAG_LOG=1; shift ;;
         --usb-modem-vid) USB_MODEM_VID="$2"; shift 2 ;;
         --usb-modem-pid) USB_MODEM_PID="$2"; shift 2 ;;
         --qcsuper) QCSUPER_BIN="$2"; shift 2 ;;
@@ -1869,6 +2029,11 @@ while [[ $# -gt 0 ]]; do
         --analyze-pcap) ANALYZE_PCAP="$2"; shift 2 ;;
         --shm) SHM_DIR="$2"; shift 2 ;;
         --extended) EXTENDED=1; shift ;;
+        --full-scan) FULL_SCAN=1; shift ;;
+        --self-test) SELF_TEST=1; shift ;;
+        --idle-cycle) IDLE_CYCLE="$2"; shift 2 ;;
+        --idle-cycle-host) IDLE_CYCLE_HOST="$2"; shift 2 ;;
+        --gnss-off) GNSS_OFF=1; shift ;;
         --ext-profile) EXT_PROFILE="$2"; shift 2 ;;
         --test-sms) TEST_SMS=1; EXTENDED=1; shift ;;
         --no-banner) BANNER_ENABLED=0; shift ;;
@@ -1904,7 +2069,17 @@ if [[ "$MDT_LED" -eq 1 && "$TUI_ENABLED" -ne 1 ]]; then
 fi
 
 if [[ "$RECONNECT_INTERVAL" -gt 0 && "$RECONNECT_INTERVAL" -lt 20 ]]; then
-    echo "ATTENZIONE: --reconnect-interval ${RECONNECT_INTERVAL}s e' molto aggressivo: il solo ciclo radio (AT+CFUN=0/1 + assestamento) richiede circa 15s, quindi con un intervallo cosi' basso il modem potrebbe restare quasi sempre in fase di riconnessione. Procedo comunque." >&2
+    echo "ATTENZIONE: --reconnect-interval ${RECONNECT_INTERVAL}s e' molto aggressivo: il solo ciclo radio (AT+CFUN=0/1 + attesa della registrazione) richiede da circa 15s fino a oltre ${RADIO_CYCLE_REG_WAIT:-60}s, quindi con un intervallo cosi' basso il modem potrebbe restare quasi sempre in fase di riconnessione. Procedo comunque." >&2
+fi
+
+if [[ "$IDLE_CYCLE" -gt 0 && "$IDLE_CYCLE" -lt 60 ]]; then
+    echo "ATTENZIONE: --idle-cycle ${IDLE_CYCLE}s e' troppo breve: l'UE torna in idle solo dopo il timer di inattivita' della rete (tipicamente 10-30s) e il Logged MDT si misura proprio in idle. Procedo comunque." >&2
+fi
+
+if [[ "$GNSS_OFF" -eq 1 && ( "$GPS_ENABLED" -eq 1 || "$GPS_WAIT" -gt 0 ) ]]; then
+    echo "ATTENZIONE: --gnss-off ha la precedenza su --gps/--gps-wait: GNSS spento per tutta la cattura, nessun fix GPS." >&2
+    GPS_ENABLED=0
+    GPS_WAIT=0
 fi
 
 if [[ "$RECONNECTS" -gt 0 && "$RECONNECT_INTERVAL" -eq 0 ]]; then
@@ -1935,7 +2110,8 @@ if [[ -n "$SHM_DIR" ]]; then
         "$SHM_DIR/extra_cellSys_L" "$SHM_DIR/extra_cellSys_N" \
         "$SHM_DIR/extra_GPSLoc_L" "$SHM_DIR/extra_GPSLoc_N" \
         "$SHM_DIR/extra_WCDMA3G_L" "$SHM_DIR/extra_WCDMA3G_N" \
-        "$SHM_DIR/mdtStop"
+        "$SHM_DIR/fullLevel" "$SHM_DIR"/full_*_L "$SHM_DIR"/full_*_N \
+        "$SHM_DIR/esito" "$SHM_DIR/mdtStop"
 fi
 
 [[ -z "$ANALYZE_DLF" || -z "$ANALYZE_PCAP" ]] || { echo "Non usare --analyze-dlf insieme a --analyze-pcap (sono alternativi: scegli la sorgente, un .dlf grezzo o un .pcap gia' pronto)." >&2; exit 1; }
@@ -1958,6 +2134,19 @@ if [[ -z "$ANALYZE_PCAP" ]]; then
         QCSUPER_CMD=("$QCSUPER_BIN")
     fi
 fi
+
+# Lanciatore della cattura live (maschera DIAG ridotta ai log di protocollo,
+# vedi --full-diag-log e src/qcsuper_run.py) e reset della maschera dopo
+# una chiusura forzata di qcsuper (vedi diag_mask_reset() e
+# src/diag_mask_reset.py). Il marcatore sta in /run (tmpfs, svuotato a ogni
+# riavvio, come il modem che si riaccende senza maschera impostata) e
+# sopravvive alla singola esecuzione di mdtcap: se una cattura viene
+# chiusa con SIGKILL (anche dall'esterno, es. mdtmain --stop) la
+# successiva lo trova e azzera la maschera prima di avviare qcsuper.
+QCSUPER_RUN="$SCRIPT_DIR/src/qcsuper_run.py"
+DIAG_MASK_RESET="$SCRIPT_DIR/src/diag_mask_reset.py"
+DIAG_DIRTY_MARKER="/run/mdtcap_diag_dirty"
+QCSUPER_DIAG_ARG=""
 
 require_cmd python3
 require_cmd sha256sum
@@ -1987,6 +2176,31 @@ extra_scan_get_defs() {
     done <<< "$out"
 }
 extra_scan_get_defs
+
+# Stesse definizioni per il gruppo di --full-scan ("extra_scan --get-defs
+# --set full"), lette solo se --full-scan e' attivo. A differenza del
+# gruppo --extended, livelli e conteggi stanno in array associativi
+# indicizzati per categoria (FULL_L/FULL_N): aggiungere una categoria in
+# src/extra_scan non richiede modifiche qui.
+declare -A FULL_SCAN_DEFS=()
+FULL_SCAN_DEFS_ORDER=()
+declare -A FULL_L=()
+declare -A FULL_N=()
+FULL_LEVEL="I"
+full_scan_get_defs() {
+    [[ -f "$EXTRA_SCAN_SCRIPT" ]] || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+    local out key val
+    out=$(python3 "$EXTRA_SCAN_SCRIPT" --get-defs --set full 2>/dev/null) || return 0
+    while IFS=' ' read -r key val; do
+        [[ -n "$key" ]] || continue
+        FULL_SCAN_DEFS["$key"]="$val"
+        FULL_SCAN_DEFS_ORDER+=("$key")
+        FULL_L["$key"]="I"
+        FULL_N["$key"]=0
+    done <<< "$out"
+}
+[[ "$FULL_SCAN" -eq 1 ]] && full_scan_get_defs
 
 # --analyze-dlf/--analyze-pcap (modalita' replay): nessun device coinvolto,
 # --diag-port/--at-port/--autodetect non servono e non vengono validati.
@@ -2026,6 +2240,9 @@ CTX_PRE="$OUTDIR/context_pre.txt"
 CTX_POST="$OUTDIR/context_post.txt"
 PERIODIC_CSV="$OUTDIR/periodic_cell_gps.csv"
 PERIODIC_DECODED_CSV="$OUTDIR/periodic_cell_gps_decoded.csv"
+RECONNECTS_CSV="$OUTDIR/reconnects.csv"
+IDLE_CYCLES_CSV="$OUTDIR/idle_cycles.csv"
+RADIO_CYCLE_MARKER="$OUTDIR/.radio_cycle_active"
 MANIFEST="$OUTDIR/manifest.txt"
 HASH_FILE="$OUTDIR/hashes_sha256.txt"
 TUI_NET_GPS_STATUS_FILE="$OUTDIR/.tui_net_gps_status"
@@ -2229,10 +2446,16 @@ unlock_sim_pin() {
     # riconoscibile alla prima interrogazione: ritenta un paio di volte
     # prima di arrendersi, per non saltare lo sblocco per una semplice
     # race condition.
-    for attempt in 1 2 3; do
-        status=$(at_query "AT+CPIN?" 5)
-        echo "$status" | grep -qE '\+CPIN:|^OK|^ERROR|CME ERROR' && break
-        [[ "$attempt" -lt 3 ]] && sleep 2
+    # "+CME ERROR: SIM busy" (SIM ancora in inizializzazione subito dopo
+    # AT+CFUN=1, osservato sul SIM7600) non e' una risposta definitiva:
+    # ritenta fino a ~20s invece di considerarla tale.
+    for attempt in $(seq 1 10); do
+        status=$(at_query "AT+CPIN?" 5) || true
+        if echo "$status" | grep -qE '\+CPIN:|^OK|^ERROR|CME ERROR' \
+            && ! echo "$status" | grep -q 'SIM busy'; then
+            break
+        fi
+        [[ "$attempt" -lt 10 ]] && sleep 2
     done
     log "Stato SIM (AT+CPIN?): $(echo "$status" | tr -d '\r' | grep -E '^\+CPIN|^OK|^ERROR|CME ERROR' | tr '\n' ' ')"
 
@@ -2287,6 +2510,167 @@ set_apn() {
     fi
 }
 
+# Tempo massimo (secondi) di attesa della registrazione di rete dopo un
+# ciclo radio (vedi radio_cycle), interrogata ogni RADIO_CYCLE_POLL secondi.
+RADIO_CYCLE_REG_WAIT=60
+RADIO_CYCLE_POLL=2
+
+# Scarta le righe residue sulla porta AT (es. la risposta di un comando
+# rimasto a meta' perche' il processo che lo aveva inviato e' stato
+# terminato, vedi finalize), cosi' che il prossimo at_query non le scambi
+# per la propria risposta.
+at_drain() {
+    local _line
+    while IFS= read -r -t 1 -u "$AT_FD" _line; do :; done
+}
+
+# Stato di registrazione ("stat") dalla risposta a AT+CEREG?/AT+CREG?:
+# "+CEREG: <n>,<stat>[,...]" -> <stat>. Vuoto se assente. Considera solo
+# le righe con due campi numerici: un'eventuale notifica non sollecitata
+# "+CEREG: <stat>" (se le URC di registrazione sono abilitate) viene
+# ignorata invece di essere scambiata per la risposta.
+reg_stat_of() {
+    tr -d '\r' | grep -E "^\+$1:[[:space:]]*[0-9]+,[0-9]+" | head -n1 \
+        | sed -E "s/^\+$1:[[:space:]]*[0-9]+,([0-9]+).*/\1/"
+}
+
+# Sblocco PIN dopo un ciclo radio, versione per il processo in background
+# del test di riconnessione: stessi tentativi di unlock_sim_pin() (il
+# modem puo' non rispondere subito dopo AT+CFUN=1), ma senza i tui_set del
+# passo "pin" (non pertinenti a meta' cattura). Il PIN non viene loggato.
+unlock_sim_pin_quiet() {
+    local status attempt
+    # Anche senza --sim-pin: attende comunque che la SIM esca da "SIM
+    # busy", cosi' i comandi successivi (registrazione, AT+CCID del
+    # contesto) non trovano una SIM ancora in inizializzazione.
+    for attempt in $(seq 1 10); do
+        status=$(at_query "AT+CPIN?" 5) || true
+        if echo "$status" | grep -qE '\+CPIN:|^OK|^ERROR|CME ERROR' \
+            && ! echo "$status" | grep -q 'SIM busy'; then
+            break
+        fi
+        [[ "$attempt" -lt 10 ]] && sleep 2
+    done
+    [[ -n "$SIM_PIN" ]] || return 0
+    if echo "$status" | grep -q '+CPIN: SIM PIN'; then
+        if at_query "AT+CPIN=\"$SIM_PIN\"" 8 | grep -q '^OK'; then
+            log "Ciclo radio: PIN accettato"
+        else
+            log "ATTENZIONE: ciclo radio: PIN rifiutato o errore nell'invio (dettaglio omesso)"
+        fi
+    fi
+}
+
+# Attende la registrazione di rete (AT+CEREG? stat 1/5, in subordine
+# AT+CREG?) fino a RADIO_CYCLE_REG_WAIT secondi da t0, interrogando ogni
+# RADIO_CYCLE_POLL secondi con la funzione di attesa sleep_fn (sleep o
+# tui_sleep). Imposta RADIO_CYCLE_RESULT/SECONDS/CPSI (vedi radio_cycle).
+wait_for_registration() {
+    local sleep_fn="$1" t0="$2" elapsed stat
+    RADIO_CYCLE_RESULT="non_registrato"
+    while true; do
+        elapsed=$(( $(date +%s) - t0 ))
+        stat=$(at_query "AT+CEREG?" 5 | reg_stat_of CEREG) || true
+        if [[ "$stat" == "1" || "$stat" == "5" ]]; then
+            RADIO_CYCLE_RESULT="registrato"
+            break
+        fi
+        stat=$(at_query "AT+CREG?" 5 | reg_stat_of CREG) || true
+        if [[ "$stat" == "1" || "$stat" == "5" ]]; then
+            RADIO_CYCLE_RESULT="registrato_non_lte"
+            break
+        fi
+        if (( elapsed >= RADIO_CYCLE_REG_WAIT )); then
+            break
+        fi
+        "$sleep_fn" "$RADIO_CYCLE_POLL"
+    done
+    RADIO_CYCLE_SECONDS=$(( $(date +%s) - t0 ))
+    RADIO_CYCLE_CPSI=$(at_query "AT+CPSI?" 5 | tr -d '\r' | grep '^+CPSI:' || true)
+}
+
+# --idle-cycle: porta l'UE da idle a connected SENZA detach, con un solo
+# ping (AT+CPING del SIM7600, 32 byte) verso IDLE_CYCLE_HOST sul contesto
+# PDP 1, riattivato se necessario. Il Logged MDT si configura in
+# connected, si misura in idle e si recupera alla riconnessione
+# (logMeasAvailable nel SetupComplete, poi l'eventuale UEInformationRequest):
+# un ciclo radio AT+CFUN fa invece un detach, dopo il quale l'UE puo'
+# scartare configurazione e log. Il ritorno in idle e' lasciato al timer
+# di inattivita' della rete. Imposta IDLE_TRIGGER_RESULT ("inviato" |
+# "errore") e IDLE_TRIGGER_RESPONSE (risposta AT compattata).
+idle_trigger() {
+    local pdp res
+    pdp=$(at_query "AT+CGACT?" 5 | tr -d '\r' | grep '^+CGACT: 1,1' || true)
+    if [[ -z "$pdp" ]]; then
+        at_query "AT+CGACT=1,1" 8 >> "$SESSION_LOG" || true
+    fi
+    res=$(at_query "AT+CPING=\"$IDLE_CYCLE_HOST\",1,1,32,1000,10000,255" 5 | tr -d '\r' | grep -v '^$' | tr '\n' ' ' || true)
+    if [[ "$res" == *OK* ]]; then
+        IDLE_TRIGGER_RESULT="inviato"
+    else
+        IDLE_TRIGGER_RESULT="errore"
+    fi
+    IDLE_TRIGGER_RESPONSE="${res% }"
+}
+
+# Ciclo radio (AT+CFUN=0, 5s, AT+CFUN=1) per forzare un nuovo attach,
+# seguito da sblocco PIN (se richiesto) e ATTESA EFFETTIVA della
+# registrazione di rete (AT+CEREG? stat 1/5, in subordine AT+CREG? per
+# una registrazione non LTE) fino a RADIO_CYCLE_REG_WAIT secondi, invece
+# di pause fisse. Usata sia da force_lte() (main=1: processo principale,
+# tui_sleep e unlock_sim_pin completo) sia dal test di riconnessione nel
+# logger periodico (main=0: processo in background, sleep semplice e
+# unlock_sim_pin_quiet).
+#
+# Dall'AT+CFUN=0 alla fine dello sblocco PIN esiste RADIO_CYCLE_MARKER:
+# se la cattura viene chiusa proprio in quella fase (fine --duration,
+# mdtStop, Ctrl+C),
+# finalize() lo trova e riaccende la radio, invece di lasciare il modem
+# spento oltre la sessione.
+#
+# Ritorna 0 se registrato, 1 altrimenti. Imposta:
+#   RADIO_CYCLE_RESULT  "registrato" | "registrato_non_lte" | "non_registrato"
+#   RADIO_CYCLE_SECONDS secondi dalla riaccensione (AT+CFUN=1) alla
+#                       registrazione (o RADIO_CYCLE_REG_WAIT se fallita)
+#   RADIO_CYCLE_CPSI    riga +CPSI dopo il ciclo (puo' essere vuota)
+radio_cycle() {
+    local main="${1:-0}" sleep_fn=sleep
+    [[ "$main" -eq 1 ]] && sleep_fn=tui_sleep
+    RADIO_CYCLE_RESULT="non_registrato"
+    RADIO_CYCLE_SECONDS=0
+    RADIO_CYCLE_CPSI=""
+
+    : > "$RADIO_CYCLE_MARKER"
+    at_query "AT+CFUN=0" 5 >> "$SESSION_LOG" || true
+    "$sleep_fn" 5
+    at_query "AT+CFUN=1" 5 >> "$SESSION_LOG" || true
+    local t0
+    t0=$(date +%s)
+
+    if [[ "$main" -eq 1 ]]; then
+        unlock_sim_pin
+    else
+        unlock_sim_pin_quiet
+    fi
+    # Solo ora: un'interruzione durante lo sblocco PIN lascerebbe la SIM
+    # bloccata anche con la radio gia' riaccesa.
+    rm -f "$RADIO_CYCLE_MARKER"
+
+    wait_for_registration "$sleep_fn" "$t0"
+
+    case "$RADIO_CYCLE_RESULT" in
+        registrato)
+            log "Ciclo radio: registrato (LTE) in ${RADIO_CYCLE_SECONDS}s: ${RADIO_CYCLE_CPSI:-CPSI n/d}"
+            return 0 ;;
+        registrato_non_lte)
+            log "Ciclo radio: registrato, ma NON su LTE, in ${RADIO_CYCLE_SECONDS}s: ${RADIO_CYCLE_CPSI:-CPSI n/d}"
+            return 0 ;;
+        *)
+            log "ATTENZIONE: ciclo radio: NON registrato dopo ${RADIO_CYCLE_SECONDS}s: ${RADIO_CYCLE_CPSI:-CPSI n/d}"
+            return 1 ;;
+    esac
+}
+
 # Forza la modalita' LTE-only (AT+CNMP=38) e cicla il radio (AT+CFUN=0
 # poi AT+CFUN=1) per costringere il modem a un nuovo tentativo di attach,
 # specificamente su LTE invece di ripiegare automaticamente su GSM/WCDMA.
@@ -2313,24 +2697,19 @@ force_lte() {
     start_qcsuper_capture
     log "Attesa ${QCSUPER_WARMUP_WAIT}s per l'avvio completo di qcsuper prima del ciclo radio, per catturare l'intera sequenza di re-attach..."
     tui_sleep "$QCSUPER_WARMUP_WAIT"
+    QCSUPER_WARMED=1
 
     log "Forzatura modalita' LTE-only (AT+CNMP=38)..."
     at_query "AT+CNMP=38" 5 >> "$SESSION_LOG" || true
 
-    log "Ciclo radio per forzare un nuovo attach (AT+CFUN=0 poi AT+CFUN=1)..."
-    at_query "AT+CFUN=0" 5 >> "$SESSION_LOG" || true
-    tui_sleep 5
-    at_query "AT+CFUN=1" 5 >> "$SESSION_LOG" || true
-    tui_sleep 5
-
-    unlock_sim_pin
-
-    log "Attesa assestamento post-CFUN (10s)..."
-    tui_sleep 10
-    local cpsi
-    cpsi=$(at_query "AT+CPSI?" 5 | tr -d '\r' | grep '^+CPSI:' || true)
-    log "Stato rete dopo forzatura LTE-only: ${cpsi:-nessuna risposta}"
-    tui_set force_lte ok "${cpsi:-nessuna risposta}"
+    log "Ciclo radio per forzare un nuovo attach (AT+CFUN=0 poi AT+CFUN=1, attesa registrazione fino a ${RADIO_CYCLE_REG_WAIT}s)..."
+    radio_cycle 1 || true
+    log "Stato rete dopo forzatura LTE-only: ${RADIO_CYCLE_CPSI:-nessuna risposta}"
+    if [[ "$RADIO_CYCLE_RESULT" == "non_registrato" ]]; then
+        tui_set force_lte skip "non registrato dopo ${RADIO_CYCLE_SECONDS}s"
+    else
+        tui_set force_lte ok "${RADIO_CYCLE_CPSI:-nessuna risposta}"
+    fi
 }
 
 # Ritorna 0 se il modem e' agganciato a una cella LTE (unico RAT in cui sono
@@ -2469,6 +2848,106 @@ query_lbs() {
 # e' ma per qualche motivo non l'ha gia' avviata). Errore fatale (exit 1)
 # se qcsuper termina subito dopo l'avvio.
 QCSUPER_STARTED=0
+# --self-test: verifica che la cattura veda davvero il traffico che deve
+# analizzare. Forza un riaggancio (radio_cycle, un detach/attach) e
+# controlla che nel .dlf in scrittura compaiano NUOVI record LTE RRC OTA
+# (0xB0C0) e NAS EMM OTA (0xB0EC/0xB0ED) entro SELF_TEST_WAIT secondi.
+# Se mancano (firmware che filtra/tronca quei log code, porta DIAG non
+# attiva, maschera non abilitata) la cattura PROSEGUE comunque, mai
+# bloccata (es. --edge-mode), ma il risultato "fail" e' registrato in
+# log, TUI e manifest.json ("selfTest"): un risultato negativo di quella
+# sessione non dimostra nulla.
+QCSUPER_WARMED=0
+SELF_TEST_RESULT="off"
+SELF_TEST_NOTE=""
+
+# Stampa "<rrc> <nas>": numero di record 0xB0C0 e 0xB0EC/0xB0ED nel .dlf
+# (un record troncato in coda, ancora in scrittura, viene ignorato).
+dlf_rrc_nas_counts() {
+    python3 -c '
+import struct, sys
+try:
+    data = open(sys.argv[1], "rb").read()
+except OSError:
+    print("0 0"); sys.exit(0)
+off = rrc = nas = 0
+while off + 12 <= len(data):
+    length, code = struct.unpack_from("<HH", data, off)
+    if length < 12 or off + length > len(data):
+        break
+    if code == 0xB0C0:
+        rrc += 1
+    elif code in (0xB0EC, 0xB0ED):
+        nas += 1
+    off += length
+print(rrc, nas)
+' "$DLF_FILE"
+}
+
+run_self_test() {
+    [[ "$SELF_TEST" -eq 1 ]] || return 0
+    tui_set self_test running
+    if [[ "$QCSUPER_WARMED" -ne 1 ]]; then
+        log "Self-test: attesa ${QCSUPER_WARMUP_WAIT}s per l'avvio completo di qcsuper..."
+        tui_sleep "$QCSUPER_WARMUP_WAIT"
+        QCSUPER_WARMED=1
+    fi
+    local pre_rrc pre_nas rrc nas waited=0
+    read -r pre_rrc pre_nas < <(dlf_rrc_nas_counts)
+    log "Self-test log DIAG: riaggancio forzato e verifica di nuovi record RRC (0xB0C0) e NAS (0xB0EC/ED) entro ${SELF_TEST_WAIT}s..."
+    radio_cycle 1 || true
+    while true; do
+        read -r rrc nas < <(dlf_rrc_nas_counts)
+        rrc=$((rrc - pre_rrc)); nas=$((nas - pre_nas))
+        if (( rrc > 0 && nas > 0 )); then
+            SELF_TEST_RESULT="ok"
+            break
+        fi
+        if (( waited >= SELF_TEST_WAIT )); then
+            SELF_TEST_RESULT="fail"
+            break
+        fi
+        tui_sleep 2
+        waited=$((waited + 2))
+    done
+    SELF_TEST_NOTE="RRC +$rrc, NAS +$nas dopo il riaggancio"
+    if [[ "$SELF_TEST_RESULT" == "ok" ]]; then
+        log "Self-test superato: $SELF_TEST_NOTE."
+        tui_set self_test ok "$SELF_TEST_NOTE"
+    else
+        log "ATTENZIONE: self-test FALLITO ($SELF_TEST_NOTE): la cattura non riceve log RRC e/o NAS (firmware che filtra i log code, maschera DIAG non abilitata o porta DIAG inattiva). Prosegue comunque, ma un risultato negativo di questa sessione non dimostra nulla."
+        tui_set self_test error "$SELF_TEST_NOTE"
+    fi
+}
+
+# Azzera la maschera di log DIAG del modem (src/diag_mask_reset.py) sulla
+# porta $1 (stesso argomento di "qcsuper --usb-modem"). Rimuove il
+# marcatore DIAG_DIRTY_MARKER solo se il reset e' verificato (flusso DIAG
+# in ingresso sotto soglia). Imposta DIAG_RESET_NOTE. Non bloccante.
+DIAG_RESET_NOTE=""
+diag_mask_reset() {
+    local arg="$1" out rc=0
+    out=$(python3 "$DIAG_MASK_RESET" "$QCSUPER_BIN" "$arg" 2>>"$SESSION_LOG") || rc=$?
+    log "Reset maschera DIAG su $arg: ${out:-nessun output} (exit $rc)"
+    if [[ "$rc" -eq 0 ]]; then
+        rm -f "$DIAG_DIRTY_MARKER"
+        DIAG_RESET_NOTE="maschera DIAG azzerata"
+    else
+        DIAG_RESET_NOTE="reset maschera DIAG NON verificato (${out:-errore})"
+    fi
+    return "$rc"
+}
+
+# Argomento per "qcsuper --usb-modem" (device path o VID:PID, vedi
+# --usb-modem), usato sia per la cattura sia per il reset della maschera.
+qcsuper_diag_arg() {
+    if [[ "$USB_MODEM_MODE" -eq 1 ]]; then
+        echo "${USB_MODEM_VID}:${USB_MODEM_PID}"
+    else
+        echo "$DIAG_PORT"
+    fi
+}
+
 start_qcsuper_capture() {
     [[ "$QCSUPER_STARTED" -eq 1 ]] && return 0
     tui_set qcsuper_start running
@@ -2485,10 +2964,24 @@ start_qcsuper_capture() {
     # potrebbe ridurre gli avvisi "Wrong CRC" su catture con molto
     # traffico diag, se la causa e' un overrun dovuto alla lettura
     # byte-a-byte sotto carico — vedi "Warning diag port"/compute_diag_warn_count().
-    local usb_modem_arg="$DIAG_PORT"
-    [[ "$USB_MODEM_MODE" -eq 1 ]] && usb_modem_arg="${USB_MODEM_VID}:${USB_MODEM_PID}"
-    log "Avvio qcsuper su $usb_modem_arg$( [[ "$USB_MODEM_MODE" -eq 1 ]] && echo " (--usb-modem: VID:PID invece del device path $DIAG_PORT)" )..."
-    "${QCSUPER_CMD[@]}" --usb-modem "$usb_modem_arg" \
+    local usb_modem_arg
+    usb_modem_arg=$(qcsuper_diag_arg)
+    QCSUPER_DIAG_ARG="$usb_modem_arg"
+    if [[ -f "$DIAG_DIRTY_MARKER" ]]; then
+        log "ATTENZIONE: la cattura precedente ha chiuso qcsuper con SIGKILL ($DIAG_DIRTY_MARKER): azzero la maschera DIAG prima di avviare qcsuper..."
+        diag_mask_reset "$usb_modem_arg" || true
+    fi
+    # Default: maschera ridotta ai log di protocollo (src/qcsuper_run.py);
+    # --full-diag-log: qcsuper diretto, tutti i log code (comportamento
+    # precedente). Vedi --full-diag-log in testa allo script.
+    # Sempre tramite il lanciatore, anche con --full-diag-log: ripristina
+    # SIGINT (ignorato nei processi in background di uno script bash),
+    # cosi' il "kill -INT" di finalize() chiude qcsuper in modo pulito.
+    local -a launch_cmd=(python3 "$QCSUPER_RUN")
+    [[ "$FULL_DIAG_LOG" -eq 1 ]] && launch_cmd+=(--full-mask)
+    launch_cmd+=("$QCSUPER_BIN")
+    log "Avvio qcsuper su $usb_modem_arg$( [[ "$USB_MODEM_MODE" -eq 1 ]] && echo " (--usb-modem: VID:PID invece del device path $DIAG_PORT)" ), maschera DIAG: $( [[ "$FULL_DIAG_LOG" -eq 1 ]] && echo "completa (--full-diag-log)" || echo "solo log di protocollo" )..."
+    "${launch_cmd[@]}" --usb-modem "$usb_modem_arg" \
         --dlf-dump "$DLF_FILE" \
         --pcap-dump "$PCAP_FILE" \
         --reassemble-sibs --decrypt-nas \
@@ -2713,9 +3206,12 @@ compute_imei_context() {
         ctx_file="$CTX_PRE"
     fi
     if [[ -n "$ctx_file" ]]; then
-        CTX_IMEI=$(ctx_section "$ctx_file" '^## AT\+CGSN' | grep -E '^[0-9]{14,16}$' | head -n1)
-        CTX_ICCID=$(ctx_section "$ctx_file" '^## AT\+CCID' | grep -E '^\+I?CCID:' | sed -E 's/^\+I?CCID:[[:space:]]*//' | head -n1)
-        cpsi_line=$(ctx_section "$ctx_file" '^## AT\+CPSI' | grep -E '^\+CPSI:' | head -n1)
+        # "|| true": un campo assente nel contesto (es. AT+CCID con "SIM
+        # busy") non deve far abortire lo script sotto set -euo pipefail
+        # prima di report/hash/manifest — il valore resta semplicemente vuoto.
+        CTX_IMEI=$(ctx_section "$ctx_file" '^## AT\+CGSN' | grep -E '^[0-9]{14,16}$' | head -n1) || true
+        CTX_ICCID=$(ctx_section "$ctx_file" '^## AT\+CCID' | grep -E '^\+I?CCID:' | sed -E 's/^\+I?CCID:[[:space:]]*//' | head -n1) || true
+        cpsi_line=$(ctx_section "$ctx_file" '^## AT\+CPSI' | grep -E '^\+CPSI:' | head -n1) || true
         mccmnc=$(echo "$cpsi_line" | sed -E 's/^\+CPSI:[[:space:]]*[^,]+,[^,]+,([0-9]+)-([0-9]+),.*/\1 \2/')
         if [[ -n "$cpsi_line" && "$mccmnc" != "$cpsi_line" ]]; then
             CTX_MCC=$(echo "$mccmnc" | cut -d' ' -f1)
@@ -2851,6 +3347,151 @@ compute_extra_scan() {
     tui_set extra_scan ok "extraLevel=$EXTRA_LEVEL"
 }
 
+# Scansione completa (--full-scan): src/extra_scan --set full (categorie
+# MDTExt/LPP/MeasCfg/UECap, regole in extra_configs/full_scan.conf).
+# Indipendente da --extended. Stesse regole op/profilo di
+# compute_extra_scan (--op o MCC/MNC, --ext-profile). L'impronta della
+# UECapabilityInformation viene confrontata con quella salvata per lo
+# stesso IMEI e aggiornata solo nelle catture live (mai in replay).
+compute_full_scan() {
+    local full_report="$OUTDIR/full_scan_report.txt"
+
+    [[ "$FULL_SCAN" -eq 1 ]] || return 0
+    tui_set full_scan running
+
+    if [[ ! -f "$EXTRA_SCAN_SCRIPT" ]] || ! command -v python3 >/dev/null 2>&1; then
+        log "ATTENZIONE: $EXTRA_SCAN_SCRIPT o python3 non disponibile, scansione completa saltata."
+        echo "Scansione completa non eseguita: $EXTRA_SCAN_SCRIPT o python3 non disponibile." > "$full_report"
+        tui_set full_scan skip "script non disponibile"
+        return 0
+    fi
+
+    local -a op_args=()
+    if [[ -n "$OP_NAME" ]]; then
+        op_args=(--op "$OP_NAME")
+    elif [[ -n "$CTX_MCC" && -n "$CTX_MNC" ]]; then
+        op_args=(--mcc "$CTX_MCC" --mnc "$CTX_MNC")
+    fi
+    local -a uecap_args=()
+    [[ -n "$CTX_IMEI" ]] && uecap_args=(--imei "$CTX_IMEI")
+    [[ -z "$ANALYZE_DLF" && -z "$ANALYZE_PCAP" ]] && uecap_args+=(--uecap-update)
+
+    local full_out
+    if ! full_out=$(python3 "$EXTRA_SCAN_SCRIPT" --set full \
+        "${op_args[@]}" \
+        ${EXT_PROFILE:+--profile "$EXT_PROFILE"} \
+        --configs-dir "$EXTRA_CONFIGS_DIR" \
+        --file "$DLF_FILE" --out "$OUTDIR" \
+        "${uecap_args[@]}" 2>>"$SESSION_LOG"); then
+        log "ATTENZIONE: scansione completa fallita (vedi $SESSION_LOG e $full_report)."
+        tui_set full_scan error "vedi session.log"
+        return 0
+    fi
+
+    local key val cat
+    while IFS='=' read -r key val; do
+        case "$key" in
+            fullLevel) FULL_LEVEL="$val" ;;
+            *_L) cat="${key%_L}"; [[ -n "${FULL_SCAN_DEFS[$cat]+x}" ]] && FULL_L["$cat"]="$val" ;;
+            *_N) cat="${key%_N}"; [[ -n "${FULL_SCAN_DEFS[$cat]+x}" ]] && FULL_N["$cat"]="$val" ;;
+        esac
+    done <<< "$full_out"
+
+    for cat in "${FULL_SCAN_DEFS_ORDER[@]}"; do
+        tui_set "full_cat_$cat" "$(extra_status_for_level "${FULL_L[$cat]}")" "${FULL_L[$cat]} (${FULL_N[$cat]} evento/i)"
+    done
+    log "Scansione completa terminata: fullLevel=$FULL_LEVEL (dettaglio in $full_report)"
+    tui_set full_scan ok "fullLevel=$FULL_LEVEL"
+}
+
+# JSON {"<CAT>": {"level": L, "n": N}, ...} del gruppo --full-scan, per il
+# manifest (stessa forma di "extScanCat" di --extended).
+full_scan_cat_json() {
+    local out="" cat
+    for cat in "${FULL_SCAN_DEFS_ORDER[@]}"; do
+        [[ -n "$out" ]] && out+=", "
+        out+="\"$cat\": {\"level\": \"${FULL_L[$cat]}\", \"n\": ${FULL_N[$cat]:-0}}"
+    done
+    printf '{%s}' "$out"
+}
+
+# Esito della sessione e report di copertura (sempre, vedi "Esito e
+# copertura" in testa allo script): src/coverage_report.py scrive
+# coverage_report.txt e stampa una riga JSON da cui si leggono ESITO,
+# ESITO_MOTIVI e COVERAGE_SINTESI (per report_finale.txt/--parla-chiaro) e
+# i campi esito/esitoMotivi/coverage del manifest. Gli indicatori forti
+# sono decisi qui (stesse metriche MET_* del report e, con --full-scan,
+# MDTExt/LPP ad A): bastano a dare "rilevato" anche in una cattura in parte
+# cieca. Presuppone compute_mdt_metrics() e compute_full_scan() gia' fatte.
+compute_coverage() {
+    local cov_json="$OUTDIR/.coverage.json"
+    tui_set coverage running
+    if [[ ! -f "$COVERAGE_SCRIPT" ]] || ! command -v python3 >/dev/null 2>&1; then
+        log "ATTENZIONE: $COVERAGE_SCRIPT o python3 non disponibile, esito e copertura non calcolati."
+        tui_set coverage skip "script non disponibile"
+        return 0
+    fi
+
+    local -a ind=()
+    (( MET_MDT_ANY > 0 )) && ind+=(--indicator "MDT: $MET_MDT_ANY messaggi RRC MDT (configurazione, richiesta o risposta)")
+    (( MET_RRC_RESP > 0 )) && ind+=(--indicator "risposte MDT dell'UE: $MET_RRC_RESP ($MET_RRC_RESP_GPS con posizione)")
+    (( MET_ATTIVA_HITS > 0 )) && ind+=(--indicator "richiesta esplicita di invio delle misure (logMeasReportReq): $MET_ATTIVA_HITS")
+    if [[ "$FULL_SCAN" -eq 1 ]]; then
+        [[ "${FULL_L[MDTExt]:-}" == "A" ]] && ind+=(--indicator "MDTExt a livello A (${FULL_N[MDTExt]:-0} evento/i, vedi full_scan_MDTExt.log)")
+        [[ "${FULL_L[LPP]:-}" == "A" ]] && ind+=(--indicator "LPP a livello A (${FULL_N[LPP]:-0} evento/i, vedi full_scan_LPP.log)")
+    fi
+
+    local duration=0
+    if [[ -n "$CAPTURE_START_EPOCH" && -n "$CAPTURE_END_EPOCH" ]]; then
+        duration=$((CAPTURE_END_EPOCH - CAPTURE_START_EPOCH))
+    fi
+
+    if ! python3 "$COVERAGE_SCRIPT" --out "$OUTDIR" \
+        --dlf "$DLF_FILE" --pcap "$PCAP_FILE" \
+        --qcsuper-log "$QCSUPER_LOG" --periodic-csv "$PERIODIC_DECODED_CSV" \
+        --duration "$duration" --self-test "$SELF_TEST_RESULT" --gnss "$GNSS_STATE" \
+        "${ind[@]}" > "$cov_json" 2>>"$SESSION_LOG" || [[ ! -s "$cov_json" ]]; then
+        log "ATTENZIONE: report di copertura fallito (vedi $SESSION_LOG)."
+        tui_set coverage error "vedi session.log"
+        rm -f "$cov_json"
+        return 0
+    fi
+
+    ESITO=$(coverage_field "$cov_json" esito)
+    mapfile -t ESITO_MOTIVI < <(coverage_field "$cov_json" esitoMotivi lines)
+    mapfile -t COVERAGE_SINTESI < <(coverage_field "$cov_json" sintesi lines)
+    manifest_extra esito "\"$ESITO\""
+    manifest_extra esitoMotivi "$(coverage_field "$cov_json" esitoMotivi json)"
+    manifest_extra coverage "$(coverage_field "$cov_json" coverage json)"
+    rm -f "$cov_json"
+
+    log "Esito della sessione: $ESITO (dettaglio in coverage_report.txt)"
+    local m
+    for m in "${ESITO_MOTIVI[@]}"; do log "  - $m"; done
+    case "$ESITO" in
+        rilevato) tui_set coverage error "rilevato" ;;
+        non_verificabile) tui_set coverage skip "non verificabile" ;;
+        *) tui_set coverage ok "${ESITO//_/ }" ;;
+    esac
+}
+
+# Legge il campo $2 dal JSON di src/coverage_report.py ($1): valore
+# semplice, una riga per elemento ($3=lines) o JSON compatto ($3=json).
+coverage_field() {
+    python3 - "$1" "$2" "${3:-}" <<'PYEOF'
+import json, sys
+data = json.load(open(sys.argv[1]))
+value = data.get(sys.argv[2], "")
+if sys.argv[3] == "json":
+    print(json.dumps(value, ensure_ascii=False))
+elif sys.argv[3] == "lines":
+    if value:
+        print("\n".join(value))
+else:
+    print(value)
+PYEOF
+}
+
 # Genera (stampa + salva in report_finale.txt) il riepilogo sintetico
 # richiesto da --report. Vedi il commento --report in testa allo script
 # per il significato di ciascun campo e le assunzioni fatte per "GPS"/
@@ -2926,6 +3567,8 @@ generate_final_report() {
         echo "Warning MDT (log): $warn_mdt_l"
         [[ -n "$imei_auth" ]] && echo "Autorizzazione IMEI: $imei_auth"
         echo "Risultato: $risultato"
+        echo "Esito: ${ESITO:-non calcolato (vedi session.log)}"
+        for eck in "${ESITO_MOTIVI[@]}"; do echo "  - $eck"; done
         # "Controlli extra:" (--extended, vedi src/extra_scan): etichette
         # SEMPRE presenti se extra_scan_get_defs() le ha risolte all'avvio
         # (vedi li' sopra), indipendentemente da --extended — con i
@@ -2947,6 +3590,24 @@ generate_final_report() {
                     echo "  ${EXTRA_SCAN_DEFS[$eck]} ($eck): non richiesto (--extended non specificato)"
                 done
             fi
+        fi
+        # "Scansione completa:" (--full-scan): solo se richiesta.
+        if [[ "$FULL_SCAN" -eq 1 && ${#FULL_SCAN_DEFS_ORDER[@]} -gt 0 ]]; then
+            echo
+            echo "Scansione completa:"
+            echo "  fullLevel: $FULL_LEVEL"
+            for eck in "${FULL_SCAN_DEFS_ORDER[@]}"; do
+                echo "  ${FULL_SCAN_DEFS[$eck]} ($eck): ${FULL_L[$eck]} (${FULL_N[$eck]} evento/i)"
+            done
+            echo "  (MeasCfg e' un indicatore, non una prova: vedi full_scan_report.txt)"
+        fi
+        # "Copertura:" (sempre, vedi compute_coverage()): cosa la cattura
+        # era in grado di vedere, dettaglio in coverage_report.txt.
+        if (( ${#COVERAGE_SINTESI[@]} > 0 )); then
+            echo
+            echo "Copertura:"
+            for eck in "${COVERAGE_SINTESI[@]}"; do echo "  $eck"; done
+            echo "  (dettaglio e limitazioni in coverage_report.txt)"
         fi
     } > "$OUTDIR/report_finale.txt"
 
@@ -2984,6 +3645,16 @@ generate_plain_report() {
         frase="Non lo so, mi serve piu' tempo."
     elif (( rrc_resp_gps > 0 || attiva_hits > 0 )); then
         frase="Stacca, stacca, stacca, ti stanno tracciando!"
+    elif [[ "$ESITO" == "rilevato" ]]; then
+        # Indicatori forti (configurazione MDT, MDTExt/LPP ad A, vedi
+        # compute_coverage()) senza posizione inviata o richiesta
+        # esplicitamente: non e' "Stacca", ma nemmeno "Tutto bene."
+        frase="Occhio: la rete sta raccogliendo misure su di te, per ora senza posizione."
+    elif [[ "$ESITO" == "non_verificabile" ]]; then
+        # La cattura non era in grado di vedere le richieste della rete
+        # (vedi compute_coverage()): "Tutto bene." sarebbe un falso
+        # rassicurante.
+        frase="Non lo so: questo test non poteva vedere le richieste della rete."
     else
         frase="Tutto bene."
         # Il verdetto "Tutto bene" si basa solo su cio' che tshark ha
@@ -3054,6 +3725,18 @@ ctx_section() {
 #     richiesta MDT (loggedMeasurementConfiguration e/o
 #     ueInformationRequest). Rivedere se emerge una definizione piu'
 #     precisa.
+# Aggiunge al manifest.json il campo $1 con valore JSON $2 (stringa gia'
+# codificata JSON, es. '"protocol"', '{"a": 1}', 'true'), senza toccare la
+# lista fissa di variabili MJ_* di generate_manifest_json: usato dai campi
+# introdotti con --full-scan/--self-test/esito e copertura. I frammenti
+# stanno in una cartella nascosta dell'evidenza, rimossa dopo la scrittura.
+MANIFEST_EXTRA_DIR=""
+manifest_extra() {
+    [[ -n "$MANIFEST_EXTRA_DIR" ]] || MANIFEST_EXTRA_DIR="$OUTDIR/.manifest_extra"
+    mkdir -p "$MANIFEST_EXTRA_DIR"
+    printf '%s\n' "$2" > "$MANIFEST_EXTRA_DIR/$1.json"
+}
+
 generate_manifest_json() {
     # imei/iccid/mcc/mnc/contract_id: gia' calcolati da
     # compute_imei_context() (chiamata da run_analysis_and_report()
@@ -3096,6 +3779,21 @@ generate_manifest_json() {
         length="$DURATION"
     fi
 
+    # Solo catture live: in replay (--analyze-*) nessuna maschera e' impostata.
+    if [[ -z "$ANALYZE_DLF" && -z "$ANALYZE_PCAP" ]]; then
+        manifest_extra diagMask "\"$( [[ "$FULL_DIAG_LOG" -eq 1 ]] && echo full || echo protocol )\""
+    fi
+    [[ -n "$GNSS_STATE" ]] && manifest_extra gnss "\"$GNSS_STATE\""
+    [[ "$IDLE_CYCLE" -gt 0 ]] && manifest_extra idleCycle "$IDLE_CYCLE"
+    if [[ "$SELF_TEST_RESULT" != "off" ]]; then
+        manifest_extra selfTest "{\"result\": \"$SELF_TEST_RESULT\", \"note\": \"$SELF_TEST_NOTE\"}"
+    fi
+    if [[ "$FULL_SCAN" -eq 1 ]]; then
+        manifest_extra full true
+        manifest_extra fullLevel "\"$FULL_LEVEL\""
+        manifest_extra fullScanCat "$(full_scan_cat_json)"
+    fi
+    MJ_EXTRA_DIR="$MANIFEST_EXTRA_DIR" \
     MJ_IMEI="$imei" MJ_MCC="$mcc" MJ_MNC="$mnc" MJ_ICCID="$iccid" \
     MJ_TCR="$(date -u +%s)" MJ_LTE="$lte" MJ_GPS="$gps" MJ_OK="$ok" MJ_MISS="$miss" MJ_LENGTH="$length" \
     MJ_HASMDT="$hasmdt" MJ_NUMMDT="$MET_MDT_CONFIG" MJ_REQPOS="$reqpos" MJ_REQGPS="$reqgps" \
@@ -3172,11 +3870,25 @@ if b("MJ_EXTENDED"):
         "WCDMA3G": {"level": os.environ.get("MJ_EXT_WCDMA3G_L", "I"), "n": i("MJ_EXT_WCDMA3G_N")},
     }
 
+# Frammenti aggiuntivi (vedi manifest_extra()): un file <chiave>.json per
+# campo, in ordine alfabetico, aggiunti in coda ai campi fissi sopra.
+extra_dir = os.environ.get("MJ_EXTRA_DIR", "")
+if extra_dir and os.path.isdir(extra_dir):
+    for name in sorted(os.listdir(extra_dir)):
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(extra_dir, name)) as ef:
+                data[name[:-5]] = json.load(ef)
+        except (OSError, ValueError):
+            continue
+
 with open(sys.argv[1], "w") as f:
     json.dump(data, f, indent=2, ensure_ascii=False)
     f.write("\n")
 PYEOF
 
+    [[ -n "$MANIFEST_EXTRA_DIR" ]] && rm -rf "$MANIFEST_EXTRA_DIR"
     log "manifest.json scritto in $OUTDIR/manifest.json"
 
     # --- --shm: file di stato per consumo esterno, scritti per ultimi.
@@ -3216,6 +3928,14 @@ PYEOF
             printf '%s' "$EXTRA_N_GPSLOC" > "$SHM_DIR/extra_GPSLoc_N"
             printf '%s' "$EXTRA_L_WCDMA3G" > "$SHM_DIR/extra_WCDMA3G_L"
             printf '%s' "$EXTRA_N_WCDMA3G" > "$SHM_DIR/extra_WCDMA3G_N"
+        fi
+        [[ -n "$ESITO" ]] && printf '%s' "$ESITO" > "$SHM_DIR/esito"
+        if [[ "$FULL_SCAN" -eq 1 ]]; then
+            printf '%s' "$FULL_LEVEL" > "$SHM_DIR/fullLevel"
+            for eck in "${FULL_SCAN_DEFS_ORDER[@]}"; do
+                printf '%s' "${FULL_L[$eck]}" > "$SHM_DIR/full_${eck}_L"
+                printf '%s' "${FULL_N[$eck]}" > "$SHM_DIR/full_${eck}_N"
+            done
         fi
         log "File di stato --shm scritti in $SHM_DIR"
     fi
@@ -3410,6 +4130,8 @@ run_analysis_and_report() {
     # scrive nell'outdir sono gia' pronti quando si arriva a calcolare gli
     # hash per la catena di custodia.
     compute_extra_scan
+    compute_full_scan
+    compute_coverage
 
     if [[ "$REPORT" -eq 1 ]]; then
         tui_set report running
@@ -3447,12 +4169,14 @@ run_analysis_and_report() {
     (
         cd "$OUTDIR"
         sha256sum -- *.pcap *.dlf context_*.txt periodic_cell_gps.csv \
-            periodic_cell_gps_decoded.csv \
+            periodic_cell_gps_decoded.csv reconnects.csv idle_cycles.csv \
             report_mdt_rrc.txt logged_measurement_configuration.txt \
             coordinate_estratte.csv lbs_query.txt \
             mdt_location_requests.txt mdt_location_requests_summary.csv \
-            report_finale.txt \
+            report_finale.txt coverage_report.txt \
             extra_scan_report.txt extra_scan.log \
+            full_scan_report.txt full_scan.log full_scan_*.log \
+            lpp_sessions.txt meas_config.csv ue_capability.txt \
             extra_scan_SMSSTK.log extra_scan_NASId.log extra_scan_RRCCiph.log \
             extra_scan_cellSys.log extra_scan_GPSLoc.log extra_scan_WCDMA3G.log \
             2>/dev/null
@@ -3603,6 +4327,38 @@ run_replay_pcap_mode() {
 # stati predefiniti vuoti piu' sopra proprio per questo.
 
 FINALIZED=0
+# Chiamata da finalize() dopo l'arresto del logger periodico: se la
+# cattura e' stata chiusa a meta' di un ciclo radio (RADIO_CYCLE_MARKER
+# presente: tra AT+CFUN=0 e la fine dello sblocco PIN) o se comunque il modem non risulta
+# a piena funzionalita' (AT+CFUN? diverso da 1), riaccende la radio e
+# ripete lo sblocco PIN, per non lasciare il modem spento oltre la
+# sessione di test.
+restore_radio_if_needed() {
+    local cfun interrupted=0
+    [[ -n "${AT_FD:-}" ]] || return 0
+    [[ -f "$RADIO_CYCLE_MARKER" ]] && interrupted=1
+    rm -f "$RADIO_CYCLE_MARKER"
+    if [[ "$interrupted" -eq 1 ]]; then
+        # Il processo terminato puo' aver lasciato un at_query orfano (la
+        # sostituzione di comando $(...) sopravvive al kill del logger
+        # periodico finche' non scade il suo timeout, al massimo 8s) e una
+        # risposta AT a meta': attende che finisca, poi svuota la porta.
+        sleep 8
+        at_drain
+    fi
+    cfun=$(at_query "AT+CFUN?" 5 | tr -d '\r' | grep '^+CFUN:' | sed -E 's/^\+CFUN:[[:space:]]*([0-9]+).*/\1/') || true
+    if [[ "$interrupted" -eq 0 && ( -z "$cfun" || "$cfun" == "1" ) ]]; then
+        return 0
+    fi
+    log "Radio non a piena funzionalita' a fine cattura (AT+CFUN? = ${cfun:-n/d}$( [[ "$interrupted" -eq 1 ]] && echo ", ciclo radio interrotto a meta'")): riaccendo (AT+CFUN=1)..."
+    at_query "AT+CFUN=1" 5 >> "$SESSION_LOG" || true
+    local t0
+    t0=$(date +%s)
+    unlock_sim_pin_quiet
+    wait_for_registration sleep "$t0"
+    log "Radio riaccesa (AT+CFUN=1) a fine cattura: $RADIO_CYCLE_RESULT in ${RADIO_CYCLE_SECONDS}s."
+}
+
 finalize() {
     [[ "$FINALIZED" -eq 1 ]] && return
     FINALIZED=1
@@ -3646,6 +4402,11 @@ finalize() {
         done
         if kill -0 "$QCSUPER_PID" 2>/dev/null; then
             log "qcsuper non ha risposto a SIGINT entro 15s, forzo con SIGKILL (possibile perdita di dati non ancora scritti su disco)"
+            # Senza la propria pulizia qcsuper lascia attiva sul modem la
+            # maschera di log: marcatore PRIMA del kill (se anche questo
+            # processo venisse ucciso subito dopo, la prossima cattura
+            # azzera comunque la maschera), reset subito dopo.
+            : > "$DIAG_DIRTY_MARKER" 2>/dev/null || true
             kill -KILL "$QCSUPER_PID" 2>/dev/null || true
             # "wait" esplicito sul PID appena ucciso: senza questo, bash
             # segnala comunque (in modo asincrono, alla prima occasione
@@ -3658,11 +4419,20 @@ finalize() {
             # qui sopra).
             wait "$QCSUPER_PID" 2>/dev/null || true
             qcsuper_note="forzato con SIGKILL, possibile perdita dati non ancora scritti"
+            if [[ -n "$QCSUPER_DIAG_ARG" ]]; then
+                diag_mask_reset "$QCSUPER_DIAG_ARG" || true
+                qcsuper_note+="; $DIAG_RESET_NOTE"
+            fi
         fi
     fi
     log "qcsuper terminato"
     CAPTURE_END_EPOCH=$(date +%s)
     tui_set qcsuper_stop ok "$qcsuper_note"
+
+    # PRIMA del contesto post-cattura: con la radio spenta (cattura chiusa
+    # a meta' di un ciclo radio) il contesto conterrebbe "SIM busy"/"NO
+    # SERVICE" invece dello stato reale del modem.
+    restore_radio_if_needed
 
     tui_set ctx_post running
     dump_context "$CTX_POST" "post-cattura"
@@ -3738,6 +4508,12 @@ if [[ "$REQUIRE_LTE" -eq 1 ]]; then
     fi
 fi
 
+if [[ "$GNSS_OFF" -eq 1 ]]; then
+    log "GNSS spento per tutta la cattura (--gnss-off): AT+CGPS=0"
+    at_query "AT+CGPS=0" 5 >> "$SESSION_LOG" || true
+    GNSS_STATE="off"
+fi
+
 if [[ "$GPS_ENABLED" -eq 1 || "$GPS_WAIT" -gt 0 ]]; then
     tui_set gps running
     if [[ "$GPS_ENABLED" -ne 1 ]]; then
@@ -3756,6 +4532,19 @@ if [[ "$GPS_ENABLED" -eq 1 || "$GPS_WAIT" -gt 0 ]]; then
     fi
 fi
 
+# Stato del GNSS durante la cattura (manifest "gnss"), per confrontare
+# sessioni con GNSS acceso e spento: la location info di MDT viene inclusa
+# solo se disponibile, e la rete potrebbe comportarsi diversamente.
+if [[ "$GPS_ENABLED" -eq 1 ]]; then
+    GNSS_STATE="on"
+elif [[ -z "$GNSS_STATE" ]]; then
+    case "$(at_query "AT+CGPS?" 5 | tr -d '\r' | grep '^+CGPS:' | sed -E 's/^\+CGPS:[[:space:]]*([0-9]).*/\1/' || true)" in
+        1) GNSS_STATE="on" ;;
+        0) GNSS_STATE="off" ;;
+        *) GNSS_STATE="unknown" ;;
+    esac
+fi
+
 if [[ "$NET_ATTACH_WAIT" -gt 0 ]]; then
     wait_for_net_attach || true
 fi
@@ -3772,6 +4561,7 @@ fi
 # force_lte() venisse richiamata in futuro senza passare da qui.
 
 start_qcsuper_capture
+run_self_test
 
 # ---- logger periodico cella + GPS (facoltativo) --------------------------
 #
@@ -3794,10 +4584,20 @@ echo "utc_timestamp,at_field,raw_response" > "$PERIODIC_CSV"
 echo "utc_timestamp,net_mode,net_state,mcc,mnc,tac_hex,cell_id,pci,band,earfcn,dl_bw,ul_bw,rsrq_raw,rsrp_raw,rssi_raw,rssnr_raw,gps_fix,gps_lat,gps_lon,gps_alt_m,gps_speed_kmh,gps_course_deg,gps_date_ddmmyy,gps_time_utc,cpsi_raw,cgpsinfo_raw" > "$PERIODIC_DECODED_CSV"
 
 PERIODIC_PID=""
-if [[ "$GPS_ENABLED" -eq 1 || -n "$DURATION" || "$TUI_ENABLED" -eq 1 || "$RECONNECT_INTERVAL" -gt 0 ]]; then
+if [[ "$GPS_ENABLED" -eq 1 || -n "$DURATION" || "$TUI_ENABLED" -eq 1 || "$RECONNECT_INTERVAL" -gt 0 || "$IDLE_CYCLE" -gt 0 ]]; then
     (
         reconnect_elapsed=0
         reconnect_count=0
+        reconnect_ok=0
+        reconnect_fail=0
+        if [[ "$RECONNECT_INTERVAL" -gt 0 ]]; then
+            echo "utc_timestamp,ciclo,esito,secondi_registrazione,cpsi" > "$RECONNECTS_CSV"
+        fi
+        idle_elapsed=0
+        idle_count=0
+        if [[ "$IDLE_CYCLE" -gt 0 ]]; then
+            echo "utc_timestamp,ciclo,host,esito,risposta" > "$IDLE_CYCLES_CSV"
+        fi
         while true; do
             ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
             cpsi=$(at_query "AT+CPSI?" 5 | tr '\n' '|')
@@ -3904,35 +4704,43 @@ if [[ "$GPS_ENABLED" -eq 1 || -n "$DURATION" || "$TUI_ENABLED" -eq 1 || "$RECONN
                             && mv -f "${TUI_RECONNECT_STATUS_FILE}.tmp" "$TUI_RECONNECT_STATUS_FILE" || true
                     fi
                     log "Test riconnessione #$reconnect_count: ciclo radio (AT+CFUN=0 poi AT+CFUN=1)..."
-                    at_query "AT+CFUN=0" 5 >> "$SESSION_LOG" || true
-                    sleep 5
-                    at_query "AT+CFUN=1" 5 >> "$SESSION_LOG" || true
-                    sleep 5
-                    # Come in force_lte(): dopo un ciclo CFUN serve di norma
-                    # un nuovo sblocco PIN. Qui in forma minima (non si
-                    # richiama unlock_sim_pin(), che ha i suoi tui_set sul
-                    # passo "pin" - non pertinenti a meta' cattura) invece
-                    # di duplicarne la logica di retry completa.
-                    if [[ -n "$SIM_PIN" ]]; then
-                        pin_status=$(at_query "AT+CPIN?" 5) || true
-                        if echo "$pin_status" | grep -q 'SIM PIN'; then
-                            at_query "AT+CPIN=\"$SIM_PIN\"" 8 >/dev/null 2>&1 || true
-                            sleep 3
-                        fi
+                    rc_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+                    if radio_cycle 0; then
+                        reconnect_ok=$((reconnect_ok + 1))
+                    else
+                        reconnect_fail=$((reconnect_fail + 1))
                     fi
-                    sleep 5
-                    post_cpsi=$(at_query "AT+CPSI?" 5 | tr -d '\r' | grep '^+CPSI:' || true)
-                    log "Test riconnessione #$reconnect_count completato: ${post_cpsi:-nessuna risposta}"
+                    printf '"%s",%d,"%s",%d,"%s"\n' "$rc_ts" "$reconnect_count" "$RADIO_CYCLE_RESULT" \
+                        "$RADIO_CYCLE_SECONDS" "$RADIO_CYCLE_CPSI" >> "$RECONNECTS_CSV"
+                    post_cpsi="$RADIO_CYCLE_RESULT in ${RADIO_CYCLE_SECONDS}s, ${RADIO_CYCLE_CPSI:-CPSI n/d}"
+                    log "Test riconnessione #$reconnect_count completato: $post_cpsi"
                     cap_note=""
                     if [[ "$RECONNECTS" -gt 0 && "$reconnect_count" -ge "$RECONNECTS" ]]; then
                         cap_note=" (tetto massimo --reconnects $RECONNECTS raggiunto, nessun altro ciclo in questa cattura)"
                         log "Tetto massimo di riconnessioni raggiunto (--reconnects $RECONNECTS): il test di riconnessione si ferma qui per il resto della cattura."
                     fi
                     if [[ "$TUI_ENABLED" -eq 1 ]]; then
-                        printf 'ok|%d cicli completati, ultimo: %s%s\n' "$reconnect_count" "${post_cpsi:-nessuna risposta}" "$cap_note" > "${TUI_RECONNECT_STATUS_FILE}.tmp" \
+                        rc_status=ok
+                        [[ "$RADIO_CYCLE_RESULT" == "non_registrato" ]] && rc_status=skip
+                        printf '%s|%d ok / %d falliti, ultimo: %s%s\n' "$rc_status" "$reconnect_ok" "$reconnect_fail" "$post_cpsi" "$cap_note" > "${TUI_RECONNECT_STATUS_FILE}.tmp" \
                             && mv -f "${TUI_RECONNECT_STATUS_FILE}.tmp" "$TUI_RECONNECT_STATUS_FILE" || true
                     fi
                     reconnect_elapsed=0
+                fi
+            fi
+
+            # --idle-cycle: riconnessione SENZA detach (vedi idle_trigger),
+            # stessa granularita' (GPS_INTERVAL) del test di riconnessione.
+            if [[ "$IDLE_CYCLE" -gt 0 ]]; then
+                idle_elapsed=$((idle_elapsed + GPS_INTERVAL))
+                if (( idle_elapsed >= IDLE_CYCLE )); then
+                    idle_count=$((idle_count + 1))
+                    ic_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+                    idle_trigger
+                    printf '"%s",%d,"%s","%s","%s"\n' "$ic_ts" "$idle_count" "$IDLE_CYCLE_HOST" \
+                        "$IDLE_TRIGGER_RESULT" "$IDLE_TRIGGER_RESPONSE" >> "$IDLE_CYCLES_CSV"
+                    log "Ciclo idle #$idle_count: $IDLE_TRIGGER_RESULT ($IDLE_TRIGGER_RESPONSE)"
+                    idle_elapsed=0
                 fi
             fi
 
@@ -3942,6 +4750,7 @@ if [[ "$GPS_ENABLED" -eq 1 || -n "$DURATION" || "$TUI_ENABLED" -eq 1 || "$RECONN
     PERIODIC_PID=$!
     log "Logger periodico cella/GPS avviato (PID $PERIODIC_PID, intervallo ${GPS_INTERVAL}s)"
     [[ "$RECONNECT_INTERVAL" -gt 0 ]] && log "Test riconnessione attivo: ciclo radio ogni ${RECONNECT_INTERVAL}s durante la cattura (via lo stesso processo, PID $PERIODIC_PID)"
+    [[ "$IDLE_CYCLE" -gt 0 ]] && log "Ciclo idle attivo: riconnessione senza detach ogni ${IDLE_CYCLE}s (AT+CPING verso $IDLE_CYCLE_HOST, via lo stesso processo, PID $PERIODIC_PID)"
 fi
 
 # ---- monitor MDT in background (solo --tui --mdt-led) --------------------

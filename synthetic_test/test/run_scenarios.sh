@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Test automatico di regressione per gli scenari extra_scan/--test-sms
+# Test automatico di regressione per gli scenari extra_scan/--test-sms/
+# --full-scan e per l'esito della sessione
 # generati da synthetic_test/gen_mdt_dlf.py (vedi synthetic_test/README.md,
 # sezioni "Scenari per mdtcap --extended"/"--test-sms"). Per ciascuno
 # scenario: lancia "mdtcap --analyze-dlf", legge manifest.json
@@ -20,7 +21,11 @@ KEEP_OUTDIRS=0
 [[ "${1:-}" == "--keep-outdirs" ]] && KEEP_OUTDIRS=1
 
 # nome_dlf | argomenti mdtcap | categoria attesa ("ALL5" = tutte e 5
-# RRCCiph/cellSys/WCDMA3G/NASId/SMSSTK) | livello atteso
+# RRCCiph/cellSys/WCDMA3G/NASId/SMSSTK; "full:<CAT>" = categoria del
+# gruppo --full-scan, letta da fullScanCat invece di extScanCat;
+# "esito" = esito della sessione, campo "esito" di manifest.json, vedi
+# src/coverage_report.py; "parla" = frase di --parla-chiaro, ultima riga
+# "Risultato:" di report_finale.txt) | livello, esito o frase attesi
 SCENARIOS=(
     "rrcciph-eea0|--extended|RRCCiph|A"
     "cellsys-2g-downgrade|--extended|cellSys|C"
@@ -37,6 +42,23 @@ SCENARIOS=(
     # controllo negativo: lo stesso .dlf di testsms-rrcciph, MA senza
     # --test-sms - il trigger non deve avere alcun effetto.
     "testsms-rrcciph|--extended|RRCCiph|I"
+    # gruppo --full-scan (src/extra_scan --set full)
+    "fullscan-obtain-location|--full-scan|full:MDTExt|A"
+    "fullscan-mobility-history|--full-scan|full:MDTExt|A"
+    "fullscan-log-meas-available|--full-scan|full:MDTExt|I"
+    "fullscan-lpp-request|--full-scan|full:LPP|A"
+    "fullscan-measconfig|--full-scan|full:MDTExt|C"
+    "fullscan-uecap|--full-scan|full:UECap|I"
+    # controllo negativo: --extended da solo non deve produrre fullScanCat
+    "fullscan-lpp-request|--extended|full:LPP|?"
+    # esito della sessione (sempre attivo, src/coverage_report.py)
+    "full|--parla-chiaro|esito|rilevato"
+    "nasid-identity-imsi|--parla-chiaro|esito|non_verificabile"
+    "coverage-idle-cycle|--parla-chiaro|esito|non_rilevato"
+    # frase di --parla-chiaro per ciascun esito
+    "config-only|--parla-chiaro|parla|Occhio: la rete sta raccogliendo misure su di te, per ora senza posizione."
+    "fullscan-uecap|--parla-chiaro|parla|Non lo so: questo test non poteva vedere le richieste della rete."
+    "coverage-idle-cycle|--parla-chiaro|parla|Tutto bene."
 )
 
 pass=0
@@ -48,7 +70,16 @@ check_level() {
 import json, sys
 with open('$manifest') as f:
     data = json.load(f)
+cat = '$cat'
 cats = data.get('extScanCat', {})
+if cat == 'esito':
+    esito = data.get('esito', '?')
+    print(f'esito={esito}')
+    sys.exit(0 if esito == '$expected' else 1)
+if cat.startswith('full:'):
+    level = data.get('fullScanCat', {}).get(cat[5:], {}).get('level', '?')
+    print(f'{cat}={level}')
+    sys.exit(0 if level == '$expected' else 1)
 if '$cat' == 'ALL5':
     keys = ['RRCCiph', 'cellSys', 'WCDMA3G', 'NASId', 'SMSSTK']
     levels = {k: cats.get(k, {}).get('level', '?') for k in keys}
@@ -87,6 +118,19 @@ for entry in "${SCENARIOS[@]}"; do
     if [[ ! -f "$manifest" ]]; then
         echo "FAIL  $label (manifest.json mancante in $outdir)"
         fail=$((fail + 1))
+        continue
+    fi
+
+    if [[ "$category" == "parla" ]]; then
+        detail=$(grep '^Risultato:' "$outdir/report_finale.txt" | tail -1)
+        if [[ "$detail" == "Risultato: $expected" ]]; then
+            echo "PASS  $label"
+            pass=$((pass + 1))
+            [[ "$KEEP_OUTDIRS" -eq 1 ]] || rm -rf "$outdir" "$log"
+        else
+            echo "FAIL  $label (ottenuto: $detail)"
+            fail=$((fail + 1))
+        fi
         continue
     fi
 

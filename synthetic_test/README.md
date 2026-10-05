@@ -197,6 +197,34 @@ cattura senza traffico rilevante (`extraLevel=I`). Verificato eseguendo
 `testsms-rrcciph.dlf` sia con `--test-sms` (RRCCiph=A) sia senza
 (RRCCiph=I, nessun evento).
 
+## Scenari per `mdtcap --full-scan` (`src/extra_scan --set full`)
+
+Un solo record diag ciascuno (tranne `fullscan-measconfig`), PDU
+codificate con pycrate. Livelli letti da `fullScanCat` in
+`manifest.json`, verificati da `test/run_scenarios.sh`.
+
+| Scenario | Contenuto | Regola | Atteso |
+|---|---|---|---|
+| `fullscan-obtain-location` | `RRCConnectionReconfiguration` con `otherConfig-r9` → `obtainLocationConfig-r11` | `MDTExt.obtain_location` | `MDTExt=A` |
+| `fullscan-mobility-history` | `UEInformationRequest` con `logMeasReportReq-r10` e `mobilityHistoryReportReq-r12` | `MDTExt.mobility_history_req` | `MDTExt=A` |
+| `fullscan-log-meas-available` | `RRCConnectionSetupComplete` con `logMeasAvailable-r10` | `MDTExt.log_meas_available` | `MDTExt=I` (1 evento, informativo) |
+| `fullscan-lpp-request` | NAS `Downlink Generic NAS Transport` con contenitore LPP `RequestLocationInformation` | `LPP.location_request`, `LPP.container` | `LPP=A` (2 eventi) |
+| `fullscan-measconfig` | `RRCConnectionReconfiguration` con reportConfig periodica fitta (240 ms, infinity, 8 celle, `includeLocationInfo-r10`) + 10 `measurementReport` in 30 s | `MDTExt.location_in_measconfig`, `MeasCfg.periodic_report_config` | `MDTExt=C`, `MeasCfg=I`. Le regole "a terminale fermo" scattano solo se nella cartella c'è un `periodic_cell_gps_decoded.csv` che indica il dispositivo fermo (non presente in `--analyze-dlf`) |
+| `fullscan-uecap` | `UECapabilityInformation` rel10 con `loggedMeasurementsIdle-r10` e `standaloneGNSS-Location-r10` | `UECap.mdt_capable` | `UECap=I` (1 evento), `ue_capability.txt` con i flag a 1 |
+
+## Scenari per l'esito della sessione (`src/coverage_report.py`)
+
+L'esito (`rilevato` / `non_rilevato` / `non_verificabile`) è sempre
+calcolato, senza opzioni: si legge dal campo `esito` di `manifest.json`,
+verificato da `test/run_scenarios.sh` sui tre casi.
+
+| Scenario | Contenuto | Atteso |
+|---|---|---|
+| `full` | sequenza MDT completa (vedi sopra) | `esito=rilevato`: gli indicatori MDT prevalgono anche se mancano NAS e connessioni RRC |
+| `nasid-identity-imsi` | un solo messaggio NAS, nessun record RRC | `esito=non_verificabile` (nessun record `0xB0C0`, durata 0 s, nessuna connessione RRC). Con `--parla-chiaro`: "Qualcosa è andato storto." (nessun traffico LTE) |
+| `config-only` | sola `loggedMeasurementConfiguration` | `esito=rilevato`, ma senza posizione: con `--parla-chiaro` "Occhio: la rete sta raccogliendo misure su di te, per ora senza posizione." |
+| `coverage-idle-cycle` | SIB1, due connessioni RRC complete (Setup → SetupComplete → NAS in entrambi i versi → Release) separate da 5 minuti di idle, durata ~400 s | `esito=non_rilevato`; `coverage_report.txt` con 1 ciclo connected → idle → connected (fase idle 301 s) e la cella della SIB1 (PLMN 222-01, TAC 1234) |
+
 ## Aggiungere un nuovo scenario
 
 Per testare un nuovo IE MDT (es. una futura Release 18), seguire lo schema

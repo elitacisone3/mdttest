@@ -141,10 +141,12 @@ def hdmi_display_active():
     Raspberry Pi OS da Bullseye in poi, espone cosi' lo stato hotplug per
     ciascun connettore). Best-effort: ritorna False se non determinabile
     (nessun /sys/class/drm, hardware/driver diverso, permessi, ...).
-    Usata SOLO da --edge-mode (vedi app.run_edge_mode()) per decidere se
-    proporre comunque il menu principale quando il test continuato non
-    e' configurato — non usata da --screen "normale", che non richiede
-    (e non verifica) un monitor davvero acceso."""
+    Usata SOLO da --edge-mode (vedi app.run_edge_mode()) per distinguere
+    "nessuno sta guardando" da "qualcuno ha collegato uno schermo": nel
+    secondo caso un errore di avvio viene mostrato a schermo e seguito
+    dal menu principale invece di fermare il servizio in silenzio. Non
+    usata da --screen "normale", che non richiede (e non verifica) un
+    monitor davvero acceso."""
     for status_path in glob.glob("/sys/class/drm/card*-HDMI-*/status"):
         try:
             with open(status_path, "r") as f:

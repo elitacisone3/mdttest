@@ -41,11 +41,16 @@ def run_continuous(schedule_name, mdtcap_profile_name, contract, host, sim_pin=N
     interattiva, o syslog_log.error + EXIT_ERROR in --edge-mode/nel
     percorso di collaudo).
 
-    quiet=True (--edge-mode): nessuna schermata dialog (ne' la pausa fra
-    una finestra e la successiva, ne' l'upload delle evidenze), sostituita
-    da una semplice attesa; ogni evento significativo va comunque su
-    syslog (vedi syslog_log.py — no-op finche' non abilitato, quindi
-    innocuo per l'uso interattivo normale).
+    quiet=True (collaudo dello scheduler, vedi
+    app.run_continuous_headless): nessuna schermata dialog (ne' la pausa
+    fra una finestra e la successiva, ne' l'upload delle evidenze),
+    sostituita da una semplice attesa, cosi' il log in chiaro su stdout
+    di quella modalita' resta leggibile. --edge-mode NON la usa (le sue
+    schermate sono quelle dell'uso interattivo, vedi app.run_edge_mode):
+    i syslog_log.* qui sotto non sono comunque condizionati a quiet, un
+    evento significativo finisce su syslog in ogni caso (vedi
+    syslog_log.py — no-op finche' non abilitato, quindi innocuo per l'uso
+    interattivo normale).
 
     now_fn/capture_fn/network_enabled/log_fn: SOLO per il collaudo dello
     scheduler (mdtmain --run-local --continuous --mock-time, vedi
@@ -106,8 +111,7 @@ def run_continuous(schedule_name, mdtcap_profile_name, contract, host, sim_pin=N
         args = ["--profile", mdtcap_profile_name, *line.args]
         if sim_pin:
             args += ["--sim-pin", sim_pin]
-        mdtmain_config.apply_forced_extended(args)
-        mdtmain_config.apply_test_sms(args)
+        mdtmain_config.apply_capture_options(args)
         args.append("--no-beep")
         extra_active = "--extra" in args or "--extended" in args
 
@@ -121,6 +125,11 @@ def run_continuous(schedule_name, mdtcap_profile_name, contract, host, sim_pin=N
             extra_status_fn=lambda shm: status.render_dots(
                 shm, manifest=None, extra_active=extra_active, day_state=day_state),
             on_tick=evaluate_checkpoints)
+        # La cattura ha appena disegnato a schermo in ANSI grezzo (header
+        # + pallini, vedi runner.py), fuori da ui.py: la schermata di
+        # pausa che seguira' deve ridisegnarsi, non credersi gia' a
+        # schermo.
+        ui.invalidate_screen()
 
         if manifest is not None:
             last_manifest = manifest

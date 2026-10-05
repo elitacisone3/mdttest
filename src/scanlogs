@@ -26,6 +26,8 @@ implementazione):
     <categoria extra_scan>  SMSSTK/NASId/RRCCiph/cellSys/GPSLoc/WCDMA3G,
              una riga per evento di livello W/C/A (I e' scartato: vedi
              _EXTRA_LEVELS_EMITTED) trovato in extra_scan_<CAT>.log
+    <categoria full_scan>   MDTExt/LPP/MeasCfg/UECap (mdtcap --full-scan),
+             stessa regola, da full_scan_<CAT>.log
 
 Filosofia errori (vedi anche i commenti su has_any_evidence/main):
 fatale (exit non-zero, nessun output) SOLO per: directory inesistente,
@@ -70,6 +72,8 @@ MDT_A_FILTER = ("lte-rrc.loggedMeasurementConfiguration_r10_element or "
 # da cambiare se in futuro serve anche "I".
 _EXTRA_LEVELS_EMITTED = {"W", "C", "A"}
 _EXTRA_CATEGORIES = ("SMSSTK", "NASId", "RRCCiph", "cellSys", "GPSLoc", "WCDMA3G")
+# mdtcap --full-scan (src/extra_scan --set full): log full_scan_<CAT>.log
+_FULL_CATEGORIES = ("MDTExt", "LPP", "MeasCfg", "UECap")
 
 _HEXLINE_RE = re.compile(r'^[0-9a-fA-F]{4,8}\s+((?:[0-9a-fA-F]{2}\s+){1,16})')
 _EXTRA_HEADER_RE = re.compile(r'^\[([^\]]+)\]\s+([IWCA])\s+(\S+)\s+Log\s+(.*)$')
@@ -105,7 +109,8 @@ def has_any_evidence(manifest):
                    ("hasMDT", "reqMDTPos", "reqMDTGPS", "hasRRC", "hasRRCPos"))
     any_warn = sum_warn_fields(manifest) > 0
     extended_dirty = bool(manifest.get("extended", False)) and manifest.get("extraLevel", "I") != "I"
-    return any_flag or any_warn or extended_dirty
+    full_dirty = bool(manifest.get("full", False)) and manifest.get("fullLevel", "I") != "I"
+    return any_flag or any_warn or extended_dirty or full_dirty
 
 
 # ---------------------------------------------------------------------
@@ -344,8 +349,10 @@ def _parse_iso_utc(s):
 
 def extra_scan_events(evidence_dir):
     out = []
-    for cat in _EXTRA_CATEGORIES:
-        path = os.path.join(evidence_dir, f"extra_scan_{cat}.log")
+    groups = [("extra_scan", cat) for cat in _EXTRA_CATEGORIES] + \
+             [("full_scan", cat) for cat in _FULL_CATEGORIES]
+    for prefix, cat in groups:
+        path = os.path.join(evidence_dir, f"{prefix}_{cat}.log")
         if not os.path.isfile(path):
             continue
         for ev in parse_extra_scan_log(path):

@@ -151,8 +151,10 @@ le evidenze, per un monitoraggio prolungato non presidiato). Entrambe:
   finale è uno solo;
 - se le chiavi di cifratura non risultano valide (ad esempio
   manomesse), l'invio viene disattivato automaticamente per l'intera
-  sessione (con un avviso a video, o solo su registro di sistema in
-  modalità `--edge-mode`), finché il problema non viene risolto;
+  sessione (con un avviso a video; in modalità `--edge-mode`, dove
+  nessuno deve poter restare in attesa di una risposta, l'avviso va su
+  registro di sistema e a video solo se c'è uno schermo collegato),
+  finché il problema non viene risolto;
 - conserva comunque una copia locale (o su chiavetta USB) delle
   evidenze per 7 giorni, poi le elimina automaticamente;
 - non riguarda in nessun modo i test singoli (in locale o su chiavetta

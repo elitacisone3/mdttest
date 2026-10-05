@@ -56,13 +56,21 @@ def dot_color_tracciamento(shm, manifest, day_state):
     if day_state.tracciamento_locked_red:
         return RED
     extra_level = (manifest or {}).get("extraLevel") or shm.get("extraLevel")
-    red = _b(shm, "mdt") or _b(shm, "rrc") or extra_level == "A"
+    # mdtcap --full-scan: stesso trattamento dei controlli extra
+    full_level = (manifest or {}).get("fullLevel") or shm.get("fullLevel")
+    red = _b(shm, "mdt") or _b(shm, "rrc") or extra_level == "A" or full_level == "A"
     if red:
         day_state.tracciamento_locked_red = True
         return RED
-    if extra_level in ("W", "C"):
+    if extra_level in ("W", "C") or full_level in ("W", "C"):
         return ORANGE
     return GREEN
+
+
+def _esito(shm, manifest):
+    """Esito della sessione di mdtcap (rilevato/non_rilevato/
+    non_verificabile), "" se non disponibile."""
+    return (manifest or {}).get("esito") or shm.get("esito") or ""
 
 
 def dot_color_campionamento(shm, manifest, proc_alive, elapsed_seconds):
@@ -75,6 +83,9 @@ def dot_color_campionamento(shm, manifest, proc_alive, elapsed_seconds):
     if not _b(shm, "lte") and elapsed_seconds is not None and elapsed_seconds > 60:
         return RED
     if warn_sum > 0:
+        return ORANGE
+    # la cattura non era in grado di vedere le richieste della rete
+    if _esito(shm, manifest) == "non_verificabile":
         return ORANGE
     return GREEN
 
@@ -127,7 +138,11 @@ def render_dots(shm, manifest=None, extra_active=False, day_state=None,
 
     lines = ["Generale:"]
     lines.append(f"{_DOT_CHAR[tracc]} Tracciamento")
-    lines.append(f"{_DOT_CHAR[camp]} Campionamento")
+    esito = _esito(shm, manifest)
+    if esito:
+        lines.append(f"{_DOT_CHAR[camp]} Campionamento (esito: {esito.replace('_', ' ')})")
+    else:
+        lines.append(f"{_DOT_CHAR[camp]} Campionamento")
     if extra_active:
         level = (manifest or {}).get("extraLevel") or shm.get("extraLevel") or "I"
         lines.append(f"{_DOT_CHAR[extra]} Test extra (livello {level})")

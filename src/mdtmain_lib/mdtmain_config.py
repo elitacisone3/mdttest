@@ -37,6 +37,19 @@ assente/non valida):
                      mdtcap --help), usare SOLO per verificare la catena
                      di rilevamento con l'SMS di test, mai in un test
                      reale (default 0).
+  fullScan      0/1  Scansione completa: aggiunge --full-scan a ogni
+                     invocazione di mdtcap (gruppo MDTExt/LPP/MeasCfg/
+                     UECap di src/extra_scan, separato da --extended:
+                     vedi mdtcap --help), default 0.
+  fullDiagLog   0/1  Log DIAG completo: aggiunge --full-diag-log a ogni
+                     invocazione di mdtcap (tutti i log code del modem,
+                     come le versioni precedenti). Solo diagnostica: la
+                     cattura RRC/NAS e' meno completa (vedi mdtcap
+                     --help), default 0.
+  selfTest      0/1  Self-test dei log: aggiunge --self-test a ogni
+                     invocazione di mdtcap (un riaggancio a inizio
+                     cattura per verificare che arrivino log RRC e NAS),
+                     default 0.
   alarmCheckPoint 0/1  Abilita la sirena per il comando CHECKPOINT
                      dello scheduler (vedi main_configs/profile/,
                      src/mdtmain_lib/scheduler.py) — se 0, ogni riga
@@ -86,6 +99,9 @@ DEFAULTS = {
     "doGPSFix": "0",
     "forceExtended": "0",
     "testSMS": "0",
+    "fullScan": "0",
+    "fullDiagLog": "0",
+    "selfTest": "0",
     "alarmCheckPoint": "1",
     "disableSend": "1",
     "startDisclaim": "0",
@@ -94,7 +110,7 @@ DEFAULTS = {
 }
 
 _BOOL_KEYS = {"disableNet", "disableIMEI", "disableAlarm", "autoStart", "hdmi", "doGPSFix",
-              "forceExtended", "testSMS", "alarmCheckPoint",
+              "forceExtended", "testSMS", "fullScan", "fullDiagLog", "selfTest", "alarmCheckPoint",
               "disableSend", "startDisclaim", "dataDisclaim", "autoConfig"}
 _HOUR_KEYS = {"minAlarmHour", "maxAlarmHour"}
 
@@ -198,4 +214,28 @@ def apply_test_sms(args, config=None):
     config = config if config is not None else load()
     if get_bool(config, "testSMS") and "--test-sms" not in args:
         args.append("--test-sms")
+    return args
+
+
+# Chiave booleana di mdtmain.conf -> flag mdtcap aggiunto quando vale 1.
+_CAPTURE_FLAGS = (
+    ("fullScan", "--full-scan"),
+    ("fullDiagLog", "--full-diag-log"),
+    ("selfTest", "--self-test"),
+)
+
+
+def apply_capture_options(args, config=None):
+    """Applica ad args (in place) tutte le opzioni di cattura di
+    mdtmain.conf: forceExtended/testSMS (vedi sopra) e i flag di
+    _CAPTURE_FLAGS, ciascuno aggiunto solo se non e' gia' presente (es.
+    gia' incluso da un --profile mdtcap o da una riga di schedulazione).
+    Unico punto da chiamare quando si costruiscono gli argomenti di un
+    test. Ritorna args."""
+    config = config if config is not None else load()
+    apply_forced_extended(args, config)
+    apply_test_sms(args, config)
+    for key, flag in _CAPTURE_FLAGS:
+        if get_bool(config, key) and flag not in args:
+            args.append(flag)
     return args

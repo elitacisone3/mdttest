@@ -8,8 +8,8 @@ riga di comando. Richiede root, come `mdtcap`/`mdtcontract`:
 sudo ./mdtmain
 ```
 
-Parametri opzionali, combinabili fra loro (tranne `--run-local`, vedi
-sotto):
+Parametri opzionali, combinabili fra loro (tranne `--run-local`,
+`--edge-mode` e `--stop`, vedi sotto):
 
 | Parametro | Effetto |
 |---|---|
@@ -17,6 +17,8 @@ sotto):
 | `--net-menu` | avvia direttamente sulla configurazione di rete, anche con Internet già presente o con `disableNet=1` |
 | `--auto-start` | se `autoStart=1` e un test continuato è completamente configurato (`testSim`/`mdtcapProfile`/`schedulerProfile` non vuoti) in `main_configs/mdtmain.conf`, verifica l'ICCID della SIM inserita e, se corrisponde, salta rete e menu principale riprendendo direttamente il test continuato, senza richiedere PIN né altri parametri (usa quelli salvati); se l'ICCID non corrisponde mostra "Errore sim non corrispondente" e prosegue con il menu normale (`autoStart` resta invariato: si disattiva solo dalla schermata Impostazioni) |
 | `--screen` | usa lo schermo HDMI e la tastiera collegati direttamente al dispositivo invece del terminale di lancio (console fisica `/dev/tty1`), con suoni di avviso via `aplay`, vedi sotto |
+| `--edge-mode` | equivalente a `--screen --auto-start`, ma pensato per girare come servizio non presidiato: nessuna interazione è mai *necessaria* per proseguire e ogni evento va anche su syslog. Non combinabile con gli altri flag, vedi sotto |
+| `--stop` | ferma da shell, in modo pulito, le istanze in esecuzione in `--screen` o `--edge-mode` (e quindi anche la misura in corso). Va usato da solo, vedi sotto |
 | `--run-local --profile NOME [--sim-pin PIN] [--duration MINUTI]` | salta **tutte** le schermate e lancia subito il test in locale con l'output di mdtcap grezzo (senza `--tui`), per debug |
 
 All'avvio verifica la connessione a Internet del Raspberry Pi (non
@@ -41,10 +43,11 @@ finestra "Attenzione: Problema con le chiavi GPG" con il dettaglio
 dell'errore e due pulsanti: **Ok** prosegue, ma senza alcun invio dati
 per questa sessione (nasconde le voci di menu 3/4/10/12, vedi sotto);
 **Cancel** chiude subito il programma, senza altre domande. In modalità
-`--edge-mode` lo stesso controllo avviene in modo silenzioso: l'eventuale
-problema resta solo su registro di sistema (syslog) e l'invio è
+`--edge-mode` lo stesso controllo non chiede nulla: l'invio viene
 disattivato per quell'esecuzione del servizio, che comunque prosegue
-normalmente per il resto (cattura/schedulazione locale).
+normalmente per il resto (cattura/schedulazione locale), e il problema
+va su registro di sistema (syslog) — più un avviso a schermo, se uno
+schermo HDMI risulta collegato e attivo.
 
 Il menu principale offre **sempre** tutte le opzioni seguenti,
 indipendentemente dalla connessione a Internet (le modalità che la
@@ -88,8 +91,10 @@ contattare il server) **tranne 3 e 4**, nascoste se `disableSend=1`
    `mdtcontract --get-devid`.
 9. **Impostazioni**: avvio automatico, allarmi attivi/su HDMI e relativa
    fascia oraria, fix GPS forzato prima dei test, test approfonditi
-   (`--extended`), modalità test SMS (`--test-sms`, vedi sotto) e
-   disabilitazione dell'invio delle evidenze (`disableSend`, vedi sotto
+   (`--extended`), modalità test SMS (`--test-sms`, vedi sotto),
+   scansione completa (`--full-scan`), log DIAG completo
+   (`--full-diag-log`, solo diagnostica), self-test dei log
+   (`--self-test`) e disabilitazione dell'invio delle evidenze (`disableSend`, vedi sotto
    e [doc/PRIVACY.md](PRIVACY.md): attivandola cancella anche PIN/ICCID del test
    continuato salvato, e la prima volta mostra un avviso dedicato);
    scrive
@@ -119,6 +124,9 @@ stesso (schermata "Impostazioni", "Imposta test continuato"):
 | `doGPSFix` | `0` | se `1`, prima di **qualunque** test attende un fix GPS (`mdtgps` in background, "Attesa fix GPS...") così il test parte già con un fix "caldo"; un fix mancato avvisa ma non blocca il test |
 | `forceExtended` | `0` | se `1`, aggiunge `--extended` a ogni invocazione di `mdtcap`, anche se il profilo/la schedulazione usata non lo prevede già da solo (vedi "Controlli extra" in [doc/GUIDA_MDTCAP.md](GUIDA_MDTCAP.md)) |
 | `testSMS` | `0` | se `1`, aggiunge `--test-sms` a ogni invocazione di `mdtcap` (implica `--extended` da solo, vedi "Trigger di test via SMS" in [doc/GUIDA_MDTCAP.md](GUIDA_MDTCAP.md)); usare solo per verificare la catena di rilevamento, mai in un test reale |
+| `fullScan` | `0` | se `1`, aggiunge `--full-scan` a ogni invocazione di `mdtcap`: scansione completa (IE MDT estesi, LPP, configurazione dei measurement report, UECapability), separata da `--extended` (vedi "Scansione completa" in [doc/GUIDA_MDTCAP.md](GUIDA_MDTCAP.md)) |
+| `fullDiagLog` | `0` | se `1`, aggiunge `--full-diag-log` a ogni invocazione di `mdtcap`: tutti i log DIAG del modem, come le versioni precedenti. Solo per diagnostica: la cattura RRC/NAS è meno completa (vedi "Maschera DIAG ridotta" in [doc/GUIDA_MDTCAP.md](GUIDA_MDTCAP.md)) |
+| `selfTest` | `0` | se `1`, aggiunge `--self-test` a ogni invocazione di `mdtcap`: un riaggancio a inizio cattura per verificare che arrivino davvero log RRC e NAS (vedi "Self-test dei log" in [doc/GUIDA_MDTCAP.md](GUIDA_MDTCAP.md)) |
 | `disableSend` | `1` | se `1` (default), nasconde dal menu principale "Esegui un test inviando i dati"/"Imposta test continuato" (le uniche due modalità che inviano dati a un server, vedi [doc/PRIVACY.md](PRIVACY.md)); attivandolo da Impostazioni cancella anche `testPin`/`testSim` |
 | `startDisclaim` | `0` | diventa `1` dopo il primo avvio, quando compare il disclaimer generale del programma; non si ripete |
 | `dataDisclaim` | `0` | diventa `1` la prima volta che si tocca `disableSend` dalla schermata Impostazioni, quando compare il disclaimer sull'invio dati; non si ripete |
@@ -150,4 +158,92 @@ invece del solo carattere BEL del terminale, sull'uscita audio scelta in
 Le dipendenze specifiche di questa modalità (`fbi`, `alsa-utils` per
 `aplay`/`amixer`, font console) si installano con
 `sudo ./install.sh --setup-mdtmain` (vedi [doc/INSTALLAZIONE.md](INSTALLAZIONE.md)).
+
+### Modalità servizio (`--edge-mode`)
+
+`mdtmain --edge-mode` è l'equivalente di `--screen --auto-start` per un
+dispositivo lasciato a lavorare da solo, es. come servizio systemd (non
+ancora installato: va avviato a mano per ora). La differenza con
+`--auto-start` non è quello che si vede, ma quello che **non viene mai
+chiesto**: nessuna interazione è necessaria per proseguire, quindi il
+test continuato deve essere già stato configurato almeno una volta in
+modo interattivo da **"Imposta test continuato"**
+(`autoStart`/`testSim`/`testPin`/`mdtcapProfile`/`schedulerProfile` in
+`main_configs/mdtmain.conf`). Non c'è conferma di invio dati (implicita
+nell'esistenza della configurazione salvata) né richiesta di token se il
+contratto non risulta registrato.
+
+Sullo schermo collegato al dispositivo compaiono le stesse schermate di
+`--auto-start`: lo splash iniziale, il test in corso con i quattro
+pallini di stato (accanto a "Campionamento" compare l'esito della
+sessione di `mdtcap`; il pallino diventa arancione se l'esito è "non
+verificabile", vedi "Esito della sessione e report di copertura" in
+[doc/GUIDA_MDTCAP.md](GUIDA_MDTCAP.md)), la pausa fra una finestra di schedulazione e la
+successiva, il riepilogo finale. **Premendo un tasto** il test
+continuato si ferma e si apre il menu principale (saltando la
+configurazione di rete): uscendo dal menu `mdtmain` termina, così sotto
+systemd con `Restart=always` il servizio riparte da solo e torna in
+`--edge-mode` — un tecnico può prendersi il modem per il tempo che gli
+serve e riaverlo al servizio senza fare nulla.
+
+In parallelo, ogni evento significativo (avvio/fine di un test, un
+allarme, l'invio di un'evidenza, un errore o un blocco) va **comunque
+anche** sul registro di sistema, con identificatore `mdtmain`:
+
+```bash
+journalctl -t mdtmain -f
+```
+
+È l'unico canale che resta quando nessuno sta guardando lo schermo, e
+`--edge-mode` prosegue infatti anche senza uno schermo HDMI collegato o
+funzionante. Per lo stesso motivo l'allarme (`sirena.wav`) esce sempre
+dall'uscita audio jack, indipendentemente dal parametro `hdmi` di
+`mdtmain.conf`: garantisce che si senta anche senza un altoparlante o
+una TV HDMI collegati.
+
+Un errore di avvio (test continuato non configurato, ICCID della SIM
+diverso da `testSim`, `server.conf` non valido, server irraggiungibile
+senza verifica in cache, contratto non registrato) viene mostrato a
+schermo e seguito dal menu principale **solo se** uno schermo HDMI
+risulta davvero collegato e attivo (`/sys/class/drm/*-HDMI-*/status`):
+in quel caso si assume che qualcuno sia lì per rimediare. Altrimenti
+resta solo su syslog e `mdtmain` esce con codice di errore, lasciando a
+systemd la decisione su cosa fare.
+
+Infine, `--edge-mode` usa un file pid (`/run/mdtmain_edge.pid`): se
+un'altra istanza di `mdtmain` viene avviata mentre il servizio è in
+esecuzione — **in qualunque modalità**, non solo `--edge-mode` — il
+servizio viene chiuso (`SIGTERM`, con arresto pulito di un'eventuale
+cattura in corso) prima che la nuova istanza prosegua. Un uso
+interattivo non deve mai competere con il servizio automatico per lo
+stesso modem. Rilanciare `--edge-mode` è quindi anche il modo di
+"riavviare" il servizio.
+
+### Arresto da shell (`--stop`)
+
+`sudo ./mdtmain --stop` ferma tutte le istanze di `mdtmain` avviate con
+`--screen` o `--edge-mode`, senza dover ricorrere a `killall python3`
+(che fermerebbe qualunque programma Python). Le istanze sono trovate
+tramite i file pid `/run/mdtmain_edge.pid` e `/run/mdtmain_screen.pid`
+(scritti all'avvio, rimossi all'uscita) e viene segnalato solo un
+processo che è davvero `mdtmain`, mai un pid riciclato da altro.
+
+L'istanza riceve `SIGTERM` e:
+
+- se c'è una misura in corso, `mdtcap` viene fermato come con un tasto
+  premuto (file `mdtStop` nella `--shm`), l'evidenza della cattura
+  interrotta viene gestita come di consueto, poi `mdtmain` esce senza
+  mostrare il riepilogo;
+- se è fermo su un menu, una finestra di dialogo o la pausa fra due
+  finestre di schedulazione, esce subito.
+
+In entrambi i casi la console viene ripristinata (getty, font, log del
+kernel). `--stop` attende fino a 60 secondi; se l'istanza non si è
+ancora chiusa, la termina con `SIGKILL` insieme ai suoi processi figli
+(`mdtcap` incluso) ed esce con codice 1. Esce con 0 se le istanze si
+sono chiuse da sole o se non ce n'era nessuna.
+
+Sotto systemd con `Restart=always`, un'istanza `--edge-mode` fermata
+con `--stop` viene riavviata dal servizio: per fermarla in modo
+definitivo usare `systemctl stop`.
 

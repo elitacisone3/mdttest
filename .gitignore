@@ -1,0 +1,61 @@
+# Dati di evidenza/log locali - non versionare (possono contenere dati
+# di localizzazione/cella reali, o crescere molto: .pcap/.dlf di catture
+# mdtcap). Le cartelle restano tracciate tramite i rispettivi .gitkeep.
+/log/data/*
+!/log/data/.gitkeep
+/log/mdt_imei_logs/*.log
+
+# Evidenze del test continuo di mdtmain, salvate qui solo come fallback
+# quando non c'e' una chiavetta USB montata — stessa natura di
+# /log/data/*, ripulite comunque dopo 7 giorni da mdtmain stesso.
+/log/continuous_data/*
+!/log/continuous_data/.gitkeep
+
+# Evidenza gia' impacchettata/cifrata in attesa di invio (vedi
+# src/mdtmain_lib/evidence.py, spool_dir()) — stato runtime, non dati di
+# esempio.
+/log/spool/*
+!/log/spool/.gitkeep
+
+# Stato persistente dell'ultimo test/allarme del test continuato (vedi
+# src/mdtmain_lib/alarmstate.py) — generato/aggiornato automaticamente,
+# non un dato di esempio.
+/log/lastAlarm
+/log/lastAlarm.conf
+
+# Output ndjson di src/scanlogs (vedi src/mdtmain_lib/masterlog.py) —
+# stato runtime generato/aggiornato automaticamente, non un dato di
+# esempio.
+/log/masterSpool.ndjson
+/log/master.ndjson
+
+# Cache locale dei contratti verificati con successo (vedi
+# src/mdtmain_lib/contractcache.py) — stato runtime, non un dato di
+# esempio.
+/log/cache
+
+# Impronte UECapabilityInformation di mdtcap --full-scan (src/extra_scan
+# --set full): un file per modulo, chiamato con l'IMEI.
+/log/ue_capability/
+
+# Generato da install.sh --configure-system: backup dell'IMEI DI
+# FABBRICA reale del modulo collegato (identificativo hardware), non un
+# dato di esempio — non va versionato.
+/mdt_configs/imei
+
+# Autorizzazione al cambio IMEI scaricata da mdtmain (Download
+# configurazione): dato di provisioning specifico di questo device, non
+# un dato di esempio.
+/mdt_configs/imei_auth
+
+# Id hardware del device salvato da autoconfig.apply() (vedi
+# src/mdtmain_lib/autoconfig.py) per rilevare un cambio di hardware
+# (es. scheda SD clonata su un'altra Raspberry Pi) — dato specifico di
+# questo device, non un dato di esempio.
+/mdt_configs/system_id
+
+# Bytecode compilato di CPython, generato automaticamente eseguendo gli
+# script in src/ — mai da versionare.
+__pycache__/
+*.pyc
+.claude

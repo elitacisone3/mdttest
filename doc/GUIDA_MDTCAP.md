@@ -173,6 +173,12 @@ sudo ./mdtcap \
 | `--force-lte` | Forza LTE-only e cicla il radio per un nuovo attach (vedi sotto). Non bloccante di per sé. |
 | `--reconnect-interval SECONDS` | Cicla il radio ogni SECONDS secondi durante la cattura, senza fermarla, per osservare più riconnessioni nella stessa sessione (vedi sotto) |
 | `--reconnects N` | Tetto massimo di cicli eseguiti da `--reconnect-interval` (di cui non ha effetto senza). Default 0 = nessun tetto |
+| `--idle-cycle SECONDS` | Ogni SECONDS secondi riporta l'UE da idle a connected **senza detach** (un ping), per il Logged MDT (vedi sotto) |
+| `--idle-cycle-host HOST` | Destinazione del ping di `--idle-cycle` (default `8.8.8.8`) |
+| `--gnss-off` | Spegne il GNSS del modulo per tutta la cattura (precedenza su `--gps`/`--gps-wait`), per confrontare GNSS acceso/spento (vedi sotto) |
+| `--self-test` | Dopo l'avvio di qcsuper forza un riaggancio e verifica che arrivino log RRC e NAS (vedi sotto) |
+| `--full-scan` | Scansione completa: IE MDT estesi, LPP, configurazione dei measurement report, UECapability. Indipendente da `--extended` (vedi sotto) |
+| `--full-diag-log` | Abilita sul modem tutti i log DIAG, come le versioni precedenti: solo diagnostica, la cattura RRC/NAS è meno completa (vedi sotto) |
 | `--op OPERATORE` | Legge argomenti da `mdt_configs/op/OPERATORE.conf` (vedi sotto) |
 | `--profile PROFILO` | Legge argomenti da `mdt_configs/profile/PROFILO.conf` (vedi sotto) |
 | `--config FILE` | Legge argomenti aggiuntivi da un file di testo (vedi sotto) |
@@ -616,8 +622,11 @@ rete viene **sempre ripristinato su automatico** (`AT+CNMP=2`), per non
 lasciare il modem forzato in LTE-only oltre la sessione di test (rischio
 di restare senza servizio se la copertura LTE cala).
 
-`--force-lte` da solo non verifica né attende l'esito oltre al log
-dello stato rete: per attendere/verificare/abortire esplicitamente in
+Dopo il ciclo radio `--force-lte` attende fino a 60s che il modem
+risulti registrato (`AT+CEREG?`/`AT+CREG?`, stessa procedura della
+trappola per la riconnessione, vedi sotto) e ne riporta l'esito nel log
+e nella TUI (giallo se non registrato), ma **non blocca** la cattura in
+base al risultato: per attendere/verificare/abortire esplicitamente in
 base al risultato va combinato con `--require-lte --lte-wait SECONDS`,
 come nell'esempio sopra. Spesso usato insieme a `--apn`, quando il
 motivo per cui l'attach LTE falliva era proprio un APN errato: è
@@ -657,12 +666,28 @@ che la rete assegna automaticamente (senza forzare LTE-only). Il
 conteggio del tempo usa la stessa granularità di `--gps-interval`
 (default 30s): il ciclo scatta al primo giro utile dopo che sono
 trascorsi almeno `SECONDS` secondi dal precedente, non esattamente al
-secondo. Un valore sotto ai ~15-20s che il solo ciclo CFUN+assestamento
-richiede produce un avviso ma non viene bloccato.
+secondo. Un valore sotto ai ~20s produce un avviso ma non viene bloccato.
 
-Con `--tui` compare come voce **"Test riconnessione"**, che torna in
-giallo ad ogni ciclo e riporta in nota quanti cicli sono stati completati
-e l'ultimo stato di rete osservato. **Per default (senza
+Dopo `AT+CFUN=1` (e l'eventuale PIN) il ciclo **attende davvero la
+registrazione di rete** invece di una pausa fissa: interroga
+`AT+CEREG?` ogni 2s finché lo stato è `1` (rete di casa) o `5`
+(roaming), in subordine `AT+CREG?` per una registrazione non LTE, fino
+a un massimo di 60s. Un ciclo dura quindi da ~15s a ~75s. L'esito di
+ogni ciclo (registrato / registrato non LTE / non registrato, secondi
+impiegati, riga `+CPSI`) va in `session.log` e in `reconnects.csv`
+nella cartella di evidenza. L'intervallo fra due cicli è contato dalla
+fine del ciclo precedente.
+
+Con `--tui` compare come voce **"Test riconnessione"**: in corso durante
+il ciclo, poi verde se l'ultimo ciclo si è registrato o giallo se non si
+è registrato entro 60s, con in nota "N ok / M falliti" e l'ultimo esito.
+
+Se la cattura termina proprio a metà di un ciclo (fine `--duration`,
+`mdtStop`, Ctrl+C, `mdtmain --stop`), cioè fra `AT+CFUN=0` e la fine
+dello sblocco PIN, alla chiusura `mdtcap` riaccende la radio
+(`AT+CFUN=1`) e ripete lo sblocco PIN, così il modem non resta spento
+dopo il test. Lo stesso accade se a fine cattura `AT+CFUN?` non risponde
+`1` per qualunque altro motivo. **Per default (senza
 `--reconnect-interval`) questo test non viene mai eseguito**: nessun
 ciclo radio aggiuntivo oltre a quello eventuale di `--force-lte`.
 
@@ -679,6 +704,99 @@ senza controllo il numero di riconnessioni della SIM su catture molto
 lunghe con un intervallo basso. Default `0` = nessun tetto (cicla per
 tutta la durata). Non ha effetto senza `--reconnect-interval` (ignorato
 con un avviso).
+
+### Cicli idle senza detach (`--idle-cycle`) e GNSS spento (`--gnss-off`)
+
+```bash
+sudo ./mdtcap ... --duration 3600 --idle-cycle 600
+sudo ./mdtcap ... --duration 3600 --idle-cycle 600 --gnss-off
+```
+
+Il **Logged MDT** viene configurato dalla rete mentre l'UE è connesso
+(`loggedMeasurementConfiguration`), misurato dall'UE **in idle** e
+recuperato alla riconnessione successiva: l'UE segnala di avere log da
+consegnare (`logMeasAvailable` nel `RRCConnectionSetupComplete`) e la
+rete può chiederli con un `UEInformationRequest`. Servono quindi cicli
+connected → idle → connected, con fasi idle di durata adeguata.
+
+I cicli di `--reconnect-interval`/`--force-lte` non vanno bene per
+questo: usano `AT+CFUN=0/1`, cioè un **detach**, dopo il quale l'UE può
+scartare configurazione e log. `--idle-cycle SECONDS` invece, ogni
+SECONDS secondi, invia un singolo ping (`AT+CPING` del SIM7600, 32 byte)
+verso `--idle-cycle-host` sul contesto PDP 1 (riattivato se serve):
+l'UE apre una nuova connessione RRC **senza detach**, e torna in idle da
+solo quando scade il timer di inattività della rete.
+
+Verificato su SIM7600E-H/TIM: ogni ping produce un `RRCConnectionRequest`
+seguito da un `RRCConnectionRelease` dopo circa 3 s, nessun Detach.
+Sotto i 60 s viene stampato un avviso. Ogni ciclo va in `session.log` e
+in `idle_cycles.csv`; il manifest riporta `idleCycle`. Nota: ogni ciclo
+genera un minimo traffico dati verso l'host indicato.
+
+`--gnss-off` spegne il GNSS del modulo (`AT+CGPS=0`) per tutta la
+cattura, anche se era rimasto acceso da una sessione precedente, e ha la
+precedenza su `--gps`/`--gps-wait`. La posizione GNSS viene inclusa nei
+report MDT solo se disponibile e la rete potrebbe comportarsi
+diversamente: conviene confrontare sessioni con GNSS acceso e spento, e
+sia da fermi sia in movimento. Lo stato del GNSS durante la cattura è
+sempre nel manifest (`gnss`: `on`/`off`/`unknown`).
+
+I profili `logged-mdt` (GNSS acceso) e `logged-mdt-nognss` (GNSS
+spento) combinano `--idle-cycle 600`, `--full-scan` e una durata di 60
+minuti.
+
+### Self-test dei log (`--self-test`)
+
+Alcuni firmware filtrano o troncano dei log code DIAG, oppure la maschera
+di log non viene abilitata: in quei casi la cattura è "cieca" e un
+risultato negativo non dimostra nulla. Con `--self-test`, subito dopo
+l'avvio di qcsuper mdtcap forza un riaggancio (ciclo `AT+CFUN=0/1`) e
+verifica che nel `.dlf` compaiano entro 30 s nuovi record LTE RRC OTA
+(`0xB0C0`) e NAS EMM OTA (`0xB0EC`/`0xB0ED`).
+
+Se il self-test fallisce la cattura **prosegue** (non blocca mai, per
+esempio in `--edge-mode`), ma l'esito è in `session.log`, nella TUI
+("Self-test log DIAG") e nel manifest (`selfTest`: `result` `ok`/`fail`
+e il conteggio dei record). Costa un detach/attach in più a inizio
+sessione. Esempio reale: `RRC +46, NAS +7 dopo il riaggancio`.
+
+### Maschera DIAG ridotta (default) e `--full-diag-log`
+
+Per default mdtcap avvia qcsuper tramite `src/qcsuper_run.py`, che
+limita i log DIAG richiesti al modem a quelli di protocollo già usati
+per il `.pcap` (RRC 2G/3G/4G/5G, NAS 3G/4G). Da solo, `qcsuper
+--dlf-dump` abiliterebbe **tutti** i log code di tutti i sottosistemi.
+
+Misurato su SIM7600E-H + Raspberry Pi 3, catture da 200 s con un
+riaggancio ogni 60 s:
+
+| | Maschera ridotta (default) | `--full-diag-log` |
+|---|---|---|
+| CPU di qcsuper | ~7% | ~95% |
+| Frame CRC scartati | 0 | ~1800 |
+| Messaggi nel pcap | ~320 | 32 |
+| Riagganci completi (attach intero visibile) | 4 su 4 | 0 su 4 |
+
+Con la maschera completa qcsuper satura un core e perde a monte, senza
+alcun avviso, proprio le raffiche di messaggi degli attach. Nessuna
+analisi di mdtcap usa i log esclusi. `--full-diag-log` resta disponibile
+solo per diagnostica. Il manifest registra la modalità usata
+(`diagMask`: `protocol`/`full`).
+
+Il lanciatore ripristina anche la gestione di SIGINT: avviato in
+background da uno script, qcsuper partiva con SIGINT ignorato, quindi a
+fine cattura non si chiudeva mai da solo e veniva terminato con SIGKILL
+dopo 15 s, perdendo gli ultimi dati.
+
+**Ripristino della maschera.** Se qcsuper viene comunque terminato con
+SIGKILL, la maschera di log resta attiva sul modem, che continua a
+inviare dati sulla porta DIAG anche a cattura finita (misurati fino a
+343 KB/s), e alla cattura successiva i log non si riescono più ad
+abilitare. mdtcap la azzera subito con `src/diag_mask_reset.py`, che
+verifica l'effetto misurando il flusso in ingresso. Se non ci riesce, o
+se mdtcap stesso viene terminato, resta il marcatore
+`/run/mdtcap_diag_dirty`, che fa ripetere il reset all'avvio della
+cattura successiva.
 
 ### Configurazione di sistema (`mdt_configs/system.conf`)
 
@@ -1029,6 +1147,95 @@ cella servente): restano regole configurabili ma non producono mai
 eventi per ora. Come per il resto di questa funzionalità: "i test extra
 sono soggetti a modifiche".
 
+### Scansione completa (`--full-scan`)
+
+```bash
+sudo ./mdtcap ... --full-scan
+sudo ./mdtcap ... --full-scan --extended
+```
+
+Gruppo di controlli **separato** da `--extended` (che resta invariato e
+può essere usato insieme). Usa lo stesso motore di `src/extra_scan`
+(livelli I/W/C/A, soglie cumulative, log per categoria), con le regole di
+`extra_configs/full_scan.conf`, poi `op/`/`profile/` come `--extended`
+(`--ext-profile` vale per entrambi).
+
+| Categoria | Cosa cerca | Livello di default |
+|---|---|---|
+| `MDTExt` | `obtainLocationConfig-r11` (la rete chiede all'UE di attivare il GNSS) | A |
+| | `mobilityHistoryReportReq-r12` / `mobilityHistoryReport-r12` (storico celle e tempi) | A |
+| | `logMeasAvailable` in SetupComplete/ReestablishmentComplete/ReconfigurationComplete (l'UE ha log MDT da consegnare) | I |
+| | `includeLocationInfo` in una reportConfig (posizione nei measurement report) | C |
+| `LPP` | `RequestLocationInformation` / `ProvideLocationInformation` dentro i Generic NAS Transport | A |
+| | `RequestCapabilities` LPP | W |
+| `MeasCfg` | ogni reportConfig ricevuta, in `meas_config.csv` | I |
+| | reporting periodico fitto (≤ 2048 ms, ≥ 16 report, ≥ 3 celle) **a terminale fermo** | W |
+| | più di 6 measurement report al minuto a terminale fermo | W |
+| `UECap` | supporto al Logged MDT dichiarato (`loggedMeasurementsIdle-r10`) | I |
+| | UECapabilityInformation diversa dalla sessione precedente dello stesso IMEI | W |
+
+`MeasCfg` è un **indicatore, non una prova**: la rete configura report
+periodici anche per ottimizzazione. Diventa significativo a terminale
+fermo (calcolato da `periodic_cell_gps_decoded.csv`: GPS se disponibile,
+altrimenti cella servente) e soprattutto, in modalità federata,
+confrontato con il comportamento abituale della stessa cella e operatore.
+
+`UECap`: un UE che non dichiara `loggedMeasurementsIdle-r10` non riceve
+mai una configurazione Logged MDT, quindi l'assenza di MDT su quell'UE
+non dimostra nulla. L'impronta della capability è salvata per IMEI in
+`log/ue_capability/` e aggiornata solo nelle catture live.
+
+Risultati: sezione "Scansione completa:" in TUI e `report_finale.txt`,
+`full_scan_report.txt`, `full_scan.log`, `full_scan_<CAT>.log`, e gli
+artefatti `lpp_sessions.txt`, `meas_config.csv`, `ue_capability.txt`
+(solo se c'è qualcosa da scrivere). Nel manifest: `full`, `fullLevel`,
+`fullScanCat`; con `--shm`: `fullLevel` e `full_<CAT>_L`/`_N`.
+
+### Esito della sessione e report di copertura
+
+Sempre attivo, nessuna opzione. Un risultato negativo da solo non
+distingue "la rete non ha chiesto nulla" da "il test non era in grado di
+vederlo": a fine analisi `src/coverage_report.py` assegna alla sessione
+uno di tre esiti, sempre con l'elenco dei motivi.
+
+| Esito | Quando |
+|---|---|
+| `rilevato` | almeno un indicatore forte: le metriche MDT di `--report` (messaggi MDT, risposte MDT dell'UE, `logMeasReportReq`) o, con `--full-scan`, `MDTExt`/`LPP` a livello A. Vale anche se la cattura era in parte cieca: quello che si è visto resta visto |
+| `non_verificabile` | nessun indicatore **e** cattura "cieca": nessun record LTE RRC OTA (`0xB0C0`) o NAS OTA nel `.dlf`, abilitazione dei log fallita (timeout di `DIAG_LOG_CONFIG_F` in `qcsuper.log`), self-test fallito, durata sotto i 120 s, nessuna connessione RRC osservata |
+| `non_rilevato` | tutto il resto: la cattura poteva vedere le richieste della rete e non ne ha viste |
+
+Alcune **limitazioni** vengono elencate senza cambiare l'esito: nessun
+ciclo idle completo (il Logged MDT si misura in idle e si recupera alla
+riconnessione, vedi `--idle-cycle`), frame DIAG scartati per CRC errato,
+mobilità sconosciuta, UE che non dichiara il Logged MDT o che non ha
+inviato la UECapabilityInformation.
+
+Il dettaglio è in `coverage_report.txt`:
+
+- **log code ricevuti** con i conteggi (`0xB0C0`, `0xB0EC`/`ED`,
+  `0xB0E2`/`E3`): evidenziano firmware che filtrano o troncano dei log;
+- **intervalli senza record DIAG** oltre 60 s, frame scartati, errori e
+  timeout di `DIAG_LOG_CONFIG_F` da `qcsuper.log`. Con la maschera DIAG
+  ridotta, in idle senza traffico un intervallo lungo può essere normale:
+  va letto insieme agli stati RRC;
+- **RAT e celle**, dai campioni periodici (`periodic_cell_gps_decoded.csv`)
+  e dalle SIB1 (`cellIdentity`, TAC, PLMN);
+- **stati RRC attraversati**: connessioni (RRCConnectionSetup), rilasci,
+  cicli completi connected → idle → connected e durata delle fasi idle;
+- **contesto**: capability dichiarate (`loggedMeasurementsIdle`,
+  `standaloneGNSS`), stato del GNSS, mobilità (ferma / in movimento /
+  sconosciuta), durata, esito del self-test.
+
+In modalità replay la durata è l'arco coperto dai record del `.dlf` (o
+dai frame del pcap con `--analyze-pcap`, dove i log code non sono
+disponibili e si contano i messaggi RRC e NAS decodificati).
+
+Risultati: riga `Esito:` con i motivi e sezione "Copertura:" in
+`report_finale.txt` (con `--report`), riga "Esito e copertura" in TUI,
+frase di `--parla-chiaro` (un caso non verificabile non dice mai "Tutto
+bene." e un caso rilevato senza posizione ha una frase propria), campi `esito`, `esitoMotivi` e `coverage` in `manifest.json`,
+file `esito` con `--shm`.
+
 ### Trigger di test via SMS (`--test-sms`)
 
 ```bash
@@ -1108,7 +1315,9 @@ interpretare i campi tecnici di `--report`: stampa (e scrive in
 | `Qualcosa è andato storto.` | errori, o rete non LTE durante la cattura |
 | `Non lo so, mi serve più tempo.` | nessun traffico RRC catturato |
 | `Stacca, stacca, stacca, ti stanno tracciando!` | l'UE ha inviato coordinate GPS, oppure la rete ha chiesto esplicitamente la posizione |
-| `Tutto bene.` | nessuna coordinata GPS richiesta o inviata |
+| `Occhio: la rete sta raccogliendo misure su di te, per ora senza posizione.` | nessuno dei casi sopra, ma l'esito della sessione è `rilevato`: ad esempio la sola configurazione MDT, o `MDTExt`/`LPP` a livello A con `--full-scan` |
+| `Non lo so: questo test non poteva vedere le richieste della rete.` | nessuno dei casi sopra, ma l'esito della sessione è `non_verificabile` (vedi "Esito della sessione e report di copertura") |
+| `Tutto bene.` | nessuna coordinata GPS richiesta o inviata, in una cattura in grado di vederle |
 | `Sembra tutto apposto, ma c'è tanto rumore.` | come sopra ("Tutto bene"), MA `qcsuper` ha scartato almeno un frame per CRC errato durante questa cattura ("Warning diag port" > 0) |
 
 L'ultima frase sostituisce `Tutto bene.` (mai le altre tre) quando c'è
@@ -1233,7 +1442,8 @@ comunque calcolati allo stesso modo.
 | `mdt_location_requests.txt` / `_summary.csv` | sempre (se `tshark`) | log dedicato delle richieste MDT/posizione dalla rete (filtro più ampio del precedente, vedi sezione 3) |
 | `coordinate_estratte.csv` / `decode_coordinate.log` | sempre (se `tshark` + `decode_mdt_location.py`) | coordinate GPS/GNSS decodificate dagli IE `locationInfo` / `coarseLocationInfo-r17` |
 | `lbs_query.txt` | solo con `--lbs` | esito dell'interrogazione del servizio di localizzazione di rete |
-| `report_finale.txt` | solo con `--report` e/o `--parla-chiaro` | riepilogo Test/Operatore/UE/RRC/MDT/Risultato, ed eventualmente la riga "Risultato" in linguaggio semplice |
+| `report_finale.txt` | solo con `--report` e/o `--parla-chiaro` | riepilogo Test/Operatore/UE/RRC/MDT/Risultato/Esito e sezione "Copertura", ed eventualmente la riga "Risultato" in linguaggio semplice |
+| `coverage_report.txt` | sempre | esito della sessione con i motivi e le limitazioni, log code ricevuti, intervalli senza record DIAG, stati RRC, RAT e celle, capability, contesto (vedi "Esito della sessione e report di copertura") |
 | `qcsuper.log` | solo in cattura live | output grezzo del processo `qcsuper` durante la cattura; assente in entrambe le modalità replay; le righe WARNING che contiene sono la fonte del campo `diagWarn`/riga "Warning diag port", le righe ERROR quella di `diagError`/"Errori diag port" (vedi sotto) |
 | `qcsuper_dlf_replay.log` | solo se il `.pcap` va (ri)generato dal `.dlf` | output di `qcsuper --dlf-read`: succede sempre in `--analyze-dlf`, oppure in cattura live se `qcsuper` è stato chiuso in modo non pulito (vedi sezione 2); assente in `--analyze-pcap` (non coinvolge mai `qcsuper`) |
 | `tshark_report.err` | sempre (se `tshark`) | stderr di tutte le chiamate `tshark` (di norma solo l'avviso "running as root") |
@@ -1343,13 +1553,22 @@ raggiungibile.
 `GPSLoc`/`WCDMA3G`) con `level`/`n`. **Assenti** dal JSON (non
 semplicemente vuoti/a zero) quando `--extended` non è stato usato.
 
+**`esito`/`esitoMotivi`/`coverage`** (sempre, vedi "Esito della sessione
+e report di copertura"): `esito` è `rilevato`, `non_rilevato` o
+`non_verificabile`, `esitoMotivi` la lista dei motivi, `coverage` un
+oggetto con i dati del report di copertura (`durationS`, `diag` con log
+code e intervalli, `qcsuper`, `rrc`, `periodic` e `sib1Cells` per RAT e
+celle, `capability`, `gnss`, `mobility`, `selfTest`, `limitazioni`),
+pensato anche per confrontare sessioni diverse nella modalità federata.
+
 **`--shm DIR`**: oltre a `manifest.json`, scrive anche una serie di file
 di stato "piatti" (un valore per file: `0`/`1` per i booleani) in `DIR`,
 pensato per un percorso in tmpfs (es. `/dev/shm/mdtcap`), da cui un
 altro processo può leggere l'esito senza fare I/O su disco né parsare
 JSON: `lte`, `gps`, `mdt`, `mdtPos`, `rrc`, `rrcPos`, `contract` (il
 `contractId`), `path` (l'outdir di questa esecuzione), `ok`, `diagWarn`,
-`diagError`, `warnPosD`, `warnPosL`, `warnMDTD`, `warnMDTL`, e, solo con
+`diagError`, `warnPosD`, `warnPosL`, `warnMDTD`, `warnMDTL`, `esito` (lo
+stesso valore del campo di `manifest.json`), e, solo con
 `--extended`, `extraLevel` più `extra_<CATEGORIA>_L`/
 `extra_<CATEGORIA>_N` per ciascuna delle 6 categorie (es.
 `extra_NASId_L`)

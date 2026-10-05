@@ -37,11 +37,13 @@ _EXTRA_ORDER = {"": -1, "I": 0, "W": 1, "C": 2, "A": 3}
 
 def evidence_qualifies(manifest):
     """Stessa soglia di sempre (vedi scheduler._maybe_play_alarm): hasMDT
-    o hasRRCPos o extraLevel=='A'. Funzione a parte, riusabile, invece
-    di ripeterla inline in piu' punti."""
+    o hasRRCPos o extraLevel=='A', piu' fullLevel=='A' (mdtcap
+    --full-scan). Funzione a parte, riusabile, invece di ripeterla inline
+    in piu' punti."""
     if not manifest:
         return False
-    return bool(manifest.get("hasMDT") or manifest.get("hasRRCPos") or manifest.get("extraLevel") == "A")
+    return bool(manifest.get("hasMDT") or manifest.get("hasRRCPos") or manifest.get("extraLevel") == "A"
+                or manifest.get("fullLevel") == "A")
 
 
 def _load():

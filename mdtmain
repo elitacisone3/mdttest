@@ -76,9 +76,8 @@ Uso:
                              pensato per un uso NON presidiato, es. come
                              servizio systemd — non ancora installato su
                              questa macchina, verra' fatto in seguito:
-                             nessuna schermata dialog viene mai
-                             mostrata, ne' e' richiesta nessuna
-                             interazione, quindi il test continuato deve
+                             nessuna interazione e' MAI richiesta per
+                             proseguire, quindi il test continuato deve
                              essere gia' stato configurato ALMENO UNA
                              VOLTA in modo interattivo, da "Imposta test
                              continuato" (autoStart/testSim/testPin/
@@ -86,21 +85,42 @@ Uso:
                              main_configs/mdtmain.conf) — senza,
                              --edge-mode si ferma subito con un errore
                              (vedi sotto). Prosegue comunque anche senza
-                             uno schermo HDMI collegato o funzionante
-                             (a differenza di --screen "nudo", non e'
-                             pensato per essere guardato): l'allarme
-                             (sirena.wav) esce sempre dall'uscita audio
-                             jack, indipendentemente dal parametro
-                             "hdmi" di mdtmain.conf (garantisce che si
-                             senta anche senza un altoparlante/una TV
-                             HDMI collegata). Non stampa NULLA (ne' su
-                             stdout/stderr, ne' schermate dialog): ogni
-                             evento significativo (avvio/fine di un
-                             test, un allarme, l'invio di un'evidenza,
-                             un errore/blocco) va invece su syslog
-                             (identificatore "mdtmain", visibile con
-                             "journalctl -t mdtmain" su un sistema
-                             systemd). Usa un file pid
+                             uno schermo HDMI collegato o funzionante:
+                             l'allarme (sirena.wav) esce sempre
+                             dall'uscita audio jack, indipendentemente
+                             dal parametro "hdmi" di mdtmain.conf
+                             (garantisce che si senta anche senza un
+                             altoparlante/una TV HDMI collegata).
+                             Sulla console HDMI mostra le stesse
+                             schermate di --screen --auto-start (lo
+                             splash iniziale, il test in corso con i
+                             pallini di stato, la pausa fra una finestra
+                             di schedulazione e la successiva): premendo
+                             un tasto il test continuato si ferma e si
+                             apre il menu principale, uscendo dal quale
+                             mdtmain termina (sotto systemd con
+                             Restart=always il servizio riparte da solo
+                             e torna in --edge-mode, cosi' un tecnico
+                             puo' prendersi il modem quando gli serve).
+                             Nulla viene scritto sul terminale di
+                             lancio, che viene comunque abbandonato
+                             all'avvio (vedi src/mdtmain_lib/
+                             screenmode.py). Ogni evento significativo
+                             (avvio/fine di un test, un allarme, l'invio
+                             di un'evidenza, un errore/blocco) va
+                             COMUNQUE ANCHE su syslog (identificatore
+                             "mdtmain", visibile con "journalctl -t
+                             mdtmain" su un sistema systemd): e' l'unico
+                             canale che resta quando nessuno sta
+                             guardando lo schermo. Un errore di avvio
+                             (test continuato non configurato, ICCID
+                             della SIM diverso da testSim, server
+                             irraggiungibile, contratto non registrato)
+                             viene mostrato a schermo e seguito dal menu
+                             principale solo se uno schermo HDMI risulta
+                             davvero collegato e attivo — altrimenti
+                             resta solo su syslog e mdtmain esce con
+                             errore. Usa un file pid
                              (/run/mdtmain_edge.pid, vedi
                              src/mdtmain_lib/edgemode.py): se un'altra
                              istanza di mdtmain (in QUALUNQUE modalita',
@@ -112,8 +132,26 @@ Uso:
                              interattivo non deve mai competere con il
                              servizio automatico per lo stesso modem)
 
-I flag sopra (tranne --run-local/--edge-mode) sono combinabili fra loro.
---edge-mode non va combinato con nessun altro flag.
+    sudo ./mdtmain --stop
+                            (ferma da shell, in modo pulito, le istanze
+                             di mdtmain in esecuzione in --screen o
+                             --edge-mode — senza dover ricorrere a
+                             "killall python3": usa i file pid
+                             /run/mdtmain_edge.pid e
+                             /run/mdtmain_screen.pid, e segnala solo
+                             processi che sono davvero mdtmain. Se c'e'
+                             una misura in corso, mdtcap viene fermato
+                             come con un tasto premuto e la sua evidenza
+                             gestita normalmente, poi mdtmain esce; se e'
+                             fermo su un menu o sulla pausa fra due
+                             finestre, esce subito. Attende fino a 60
+                             secondi, poi termina l'istanza (e i suoi
+                             processi figli) con SIGKILL. Esce con 0 se
+                             le istanze si sono chiuse da sole o se non
+                             ce n'era nessuna, 1 se e' servito SIGKILL)
+
+I flag sopra (tranne --run-local/--edge-mode/--stop) sono combinabili fra
+loro. --edge-mode e --stop non vanno combinati con nessun altro flag.
 
 Richiede i permessi di root (come mdtcap/mdtcontract: accesso al modem,
 mount di dispositivi rimovibili, configurazione di rete).
@@ -125,7 +163,43 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(SCRIPT_DIR, "src"))
 
 EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_USAGE = 2
 EXIT_ROOT_REQUIRED = 3
+
+
+def _stop_instances():
+    """mdtmain --stop: vedi --help."""
+    from mdtmain_lib import constants, edgemode
+    stopped, killed = edgemode.stop_instances(
+        [constants.EDGE_MODE_PID_FILE, constants.SCREEN_MODE_PID_FILE],
+        constants.STOP_GRACE_SECONDS, log_fn=print)
+    if not stopped:
+        print("Nessuna istanza di mdtmain in esecuzione.")
+        return EXIT_OK
+    if killed:
+        print(f"mdtmain non si e' chiuso entro {constants.STOP_GRACE_SECONDS}s: terminato "
+              f"con SIGKILL (pid {', '.join(map(str, killed))}). Console/getty potrebbero non "
+              "essere stati ripristinati.", file=sys.stderr)
+        return EXIT_ERROR
+    print("mdtmain fermato.")
+    return EXIT_OK
+
+
+def _exit_on_stop_request(screen_mode):
+    """Uscita ordinata dopo stopctl.StopRequested (SIGTERM, vedi
+    mdtmain --stop). In modalita' schermo il processo e' leader del
+    proprio gruppo (setsid in screenmode.activate): chiude anche un
+    eventuale dialog(1)/aplay figlio rimasto sulla console (nessuna
+    cattura mdtcap e' in corso a questo punto, vedi stopctl.py)."""
+    import signal
+    if screen_mode:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        try:
+            os.killpg(0, signal.SIGTERM)
+        except OSError:
+            pass
+    return EXIT_OK
 
 
 def main(argv):
@@ -136,6 +210,12 @@ def main(argv):
     if os.geteuid() != 0:
         print("mdtmain: richiede i permessi di root (sudo ./mdtmain).", file=sys.stderr)
         return EXIT_ROOT_REQUIRED
+
+    if "--stop" in argv:
+        if len(argv) != 1:
+            print("mdtmain: --stop va usato da solo.", file=sys.stderr)
+            return EXIT_USAGE
+        return _stop_instances()
 
     edge_mode = "--edge-mode" in argv
 
@@ -176,8 +256,12 @@ def main(argv):
         # lanciato.
         from mdtmain_lib import mdtmain_config, screenmode, sound
         config = mdtmain_config.load()
+        # Lo splash vale anche per --edge-mode: e' il primo segno di vita
+        # sullo schermo mentre i controlli di avvio (SIM, server, fix
+        # GPS) scorrono, che altrimenti lo lascerebbero nero per qualche
+        # decina di secondi.
         screenmode.activate(hdmi=mdtmain_config.get_bool(config, "hdmi"),
-                             show_banner=(not edge_mode) and "--no-banner" not in argv)
+                             show_banner="--no-banner" not in argv)
         sound.enable()
         if edge_mode:
             # L'allarme (unico suono mai prodotto in --edge-mode) deve
@@ -186,17 +270,22 @@ def main(argv):
             # garanzia che ci sia davvero uno schermo/altoparlante HDMI
             # collegato e attivo (vedi mdtmain --help).
             screenmode.set_audio_output(hdmi=False)
-            # DOPO screenmode.activate(): quella chiamata fa un fork
-            # interno (il padre esce subito, os._exit) per staccarsi dal
-            # terminale di lancio — il pid da registrare e' quello del
-            # FIGLIO, l'unico che vive per tutta la durata del servizio.
-            edgemode.write_pid_file()
-            edgemode.install_sigterm_handler()
+        from mdtmain_lib import constants, stopctl
+        # DOPO screenmode.activate(): quella chiamata fa un fork interno
+        # (il padre esce subito, os._exit) per staccarsi dal terminale di
+        # lancio — il pid da registrare e' quello del FIGLIO, l'unico che
+        # vive per tutta la durata di mdtmain (vedi mdtmain --stop).
+        edgemode.write_pid_file(constants.EDGE_MODE_PID_FILE if edge_mode
+                                else constants.SCREEN_MODE_PID_FILE)
+        stopctl.install_sigterm_handler()
 
-    from mdtmain_lib import app, ui
+    from mdtmain_lib import app, stopctl, ui
 
     if edge_mode:
-        return app.run_edge_mode()
+        try:
+            return app.run_edge_mode()
+        except stopctl.StopRequested:
+            return _exit_on_stop_request(screen_mode)
 
     if "--run-local" in argv:
         rest = [a for a in argv if a != "--run-local"]
@@ -248,6 +337,8 @@ def main(argv):
                      auto_start=auto_start)
     except KeyboardInterrupt:
         pass
+    except stopctl.StopRequested:
+        _exit_on_stop_request(screen_mode)
     finally:
         if not screen_mode:
             ui.restore_window_title_with_fallback()

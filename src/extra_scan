@@ -111,10 +111,40 @@ extra_configs/ ma restituiscono sempre 0 occorrenze in questa versione.
 GPSLoc.cell_gps_incoherent: confronto fra cella (cell_id/pci) e distanza
 GPS fra campioni consecutivi di periodic_cell_gps_decoded.csv (prodotto
 da mdtcap nella stessa $OUT), nessuna dipendenza da tshark.
+
+Gruppo "full" (mdtcap --full-scan, argomento --set full)
+--------------------------------------------------------
+Secondo gruppo di categorie, SEPARATO da quello sopra (mdtcap
+--extended, invariato): stesso motore (regole, livelli, soglie
+cumulative, log), ma regole lette da extra_configs/full_scan.conf (poi
+op/profile come sopra) e output propri in $OUT: full_scan.log,
+full_scan_<CATEGORIA>.log, full_scan_report.txt, e su stdout le righe
+"<CAT>_L"/"<CAT>_N" delle categorie seguenti piu' "fullLevel=" invece di
+"extraLevel=":
+    MDTExt   MDT esteso      obtainLocationConfig-r11 (la rete chiede di
+                             attivare il GNSS), mobilityHistoryReportReq-
+                             r12/mobilityHistoryReport-r12 (storico
+                             celle/tempi), logMeasAvailable (l'UE
+                             dichiara log MDT da consegnare),
+                             includeLocationInfo in una reportConfig
+    LPP      Posizionamento  sessioni LPP dentro i Generic NAS Transport
+                             (Request/ProvideLocationInformation,
+                             RequestCapabilities)
+    MeasCfg  Config. misure  reportConfig periodiche fitte a terminale
+                             fermo, frequenza dei measurement report:
+                             INDICATORE, non prova
+    UECap    Capability UE   impronta della UECapabilityInformation
+                             inviata, confronto con la sessione
+                             precedente dello stesso IMEI
+Artefatti in $OUT (solo se c'e' qualcosa da scrivere): lpp_sessions.txt,
+meas_config.csv, ue_capability.txt. "extra_scan --get-defs --set full"
+stampa le definizioni di questo gruppo.
 """
 import argparse
 import configparser
 import csv
+import hashlib
+import json
 import math
 import os
 import re
@@ -126,6 +156,8 @@ from datetime import datetime, timezone
 from struct import unpack_from
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
+import mdt_mobility  # noqa: E402  (src/mdt_mobility.py)
 PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
 DEFAULT_CONFIGS_DIR = os.path.join(PROJECT_DIR, "extra_configs")
 
@@ -141,6 +173,25 @@ CATEGORIES = [
     ("WCDMA3G", "3G/UMTS"),
 ]
 CATEGORY_KEYS = [k for k, _ in CATEGORIES]
+
+# Gruppo "full" (mdtcap --full-scan): vedi docstring. Elenco separato da
+# CATEGORIES, che resta quello di --extended.
+FULL_SCAN_CATEGORIES = [
+    ("MDTExt", "MDT esteso"),
+    ("LPP", "Posizionamento LPP"),
+    ("MeasCfg", "Configurazione misure"),
+    ("UECap", "Capability UE"),
+]
+
+# Parametri che distinguono i due gruppi; i default delle funzioni comuni
+# (load_config/aggregate/write_logs/write_report) sono quelli di
+# "extended", cosi' il suo comportamento resta identico.
+SCAN_SETS = {
+    "extended": {"categories": CATEGORIES, "main_conf": "main.conf",
+                 "prefix": "extra_scan", "level_key": "extraLevel"},
+    "full": {"categories": FULL_SCAN_CATEGORIES, "main_conf": "full_scan.conf",
+             "prefix": "full_scan", "level_key": "fullLevel"},
+}
 
 CODE_LEN = 16
 LEVELS = ("I", "W", "C", "A")
@@ -189,8 +240,8 @@ def iso(ts):
 # --get-defs
 # ---------------------------------------------------------------------
 
-def cmd_get_defs():
-    for key, label in CATEGORIES:
+def cmd_get_defs(categories=CATEGORIES):
+    for key, label in categories:
         print(f"{key} {label}")
     return 0
 
@@ -210,13 +261,13 @@ def resolve_op_file(configs_dir, op, mcc, mnc):
     return None
 
 
-def load_config(configs_dir, op, profile, mcc, mnc):
+def load_config(configs_dir, op, profile, mcc, mnc, main_name="main.conf"):
     # interpolation=None: alcuni "log_msg" contengono placeholder stile
     # "%(nome)s" pensati per essere popolati dai singoli detector, non da
     # configparser stesso (che altrimenti li tratterebbe come riferimenti
     # incrociati fra chiavi INI e fallirebbe se "nome" non esiste).
     cp = configparser.ConfigParser(interpolation=None)
-    main_conf = os.path.join(configs_dir, "main.conf")
+    main_conf = os.path.join(configs_dir, main_name)
     loaded = []
     if os.path.isfile(main_conf):
         cp.read(main_conf)
@@ -255,6 +306,9 @@ def build_rules(cp):
             "mode": cp.get(section, "mode", fallback=""),
             "comment": cp.get(section, "comment", fallback=""),
             "log_msg": cp.get(section, "log_msg", fallback=""),
+            # tutte le chiavi della sezione, per i parametri specifici di
+            # un rilevatore (es. le soglie di MeasCfg nel gruppo "full")
+            "params": dict(cp.items(section)),
         }
     return rules
 
@@ -900,9 +954,9 @@ def densest_window_count(sorted_ts, window_s):
     return best
 
 
-def aggregate(rules, occ_by_rule):
-    cat_level = {k: "I" for k in CATEGORY_KEYS}
-    cat_count = {k: 0 for k in CATEGORY_KEYS}
+def aggregate(rules, occ_by_rule, keys=CATEGORY_KEYS):
+    cat_level = {k: "I" for k in keys}
+    cat_count = {k: 0 for k in keys}
     rule_results = []  # (cat, evt, base_level, final_level, count, promoted, counted)
 
     for (cat, evt), rule in rules.items():
@@ -944,15 +998,15 @@ def format_log_line(cat, evt, ts, level, detail, raw):
     return line
 
 
-def write_logs(out_dir, occurrences, rule_results, now):
-    general_path = os.path.join(out_dir, "extra_scan.log")
+def write_logs(out_dir, occurrences, rule_results, now, keys=CATEGORY_KEYS, prefix="extra_scan"):
+    general_path = os.path.join(out_dir, f"{prefix}.log")
     cat_files = {}
-    header = f"[{iso(now)}] I {make_code('SCAN', 'START')} Log Scansione extra_scan avviata\n"
+    header = f"[{iso(now)}] I {make_code('SCAN', 'START')} Log Scansione {prefix} avviata\n"
     try:
         gf = open(general_path, "w")
         gf.write(header)
-        for cat in CATEGORY_KEYS:
-            cf = open(os.path.join(out_dir, f"extra_scan_{cat}.log"), "w")
+        for cat in keys:
+            cf = open(os.path.join(out_dir, f"{prefix}_{cat}.log"), "w")
             cf.write(header)
             cat_files[cat] = cf
 
@@ -979,10 +1033,11 @@ def write_logs(out_dir, occurrences, rule_results, now):
             cf.close()
 
 
-def write_report(out_dir, rules, warnings, loaded_configs, cat_level, cat_count, rule_results, extra_level, now):
-    path = os.path.join(out_dir, "extra_scan_report.txt")
+def write_report(out_dir, rules, warnings, loaded_configs, cat_level, cat_count, rule_results, extra_level, now,
+                 categories=CATEGORIES, prefix="extra_scan", level_key="extraLevel"):
+    path = os.path.join(out_dir, f"{prefix}_report.txt")
     with open(path, "w") as f:
-        f.write(f"=== extra_scan — {iso(now)} ===\n")
+        f.write(f"=== {prefix} — {iso(now)} ===\n")
         f.write("Discriminazione iniziale, non un verdetto definitivo (i test extra sono soggetti a modifiche).\n\n")
         if loaded_configs:
             f.write("Config lette (in ordine, l'ultima puo' sovrascrivere le precedenti):\n")
@@ -997,7 +1052,7 @@ def write_report(out_dir, rules, warnings, loaded_configs, cat_level, cat_count,
             f.write("\n")
 
         f.write("Categorie:\n")
-        for cat, label in CATEGORIES:
+        for cat, label in categories:
             f.write(f"  {cat} ({label}): livello {cat_level[cat]}, {cat_count[cat]} evento/i\n")
         f.write("\n")
 
@@ -1005,7 +1060,7 @@ def write_report(out_dir, rules, warnings, loaded_configs, cat_level, cat_count,
         by_cat = defaultdict(list)
         for cat, evt, base_level, final_level, n, promoted, counted in rule_results:
             by_cat[cat].append((evt, base_level, final_level, n, promoted, counted))
-        for cat, _ in CATEGORIES:
+        for cat, _ in categories:
             for evt, base_level, final_level, n, promoted, counted in sorted(by_cat.get(cat, [])):
                 comment = rules.get((cat, evt), {}).get("comment", "")
                 if not counted:
@@ -1017,7 +1072,374 @@ def write_report(out_dir, rules, warnings, loaded_configs, cat_level, cat_count,
                 if comment:
                     f.write(f" — {comment}")
                 f.write("\n")
-        f.write(f"\nextraLevel: {extra_level}\n")
+        f.write(f"\n{level_key}: {extra_level}\n")
+
+
+
+# ---------------------------------------------------------------------
+# gruppo "full" (mdtcap --full-scan): MDTExt, LPP, MeasCfg, UECap
+# ---------------------------------------------------------------------
+
+# (evento, filtro tshark, descrizione di default se la regola non ha
+# "comment"). Filtri verificati su tshark 4.4.
+MDTEXT_SPECS = [
+    ("obtain_location", "lte-rrc.obtainLocationConfig_r11_element",
+     "La rete chiede all'UE di attivare il GNSS (obtainLocationConfig-r11)"),
+    ("mobility_history_req", "lte-rrc.mobilityHistoryReportReq_r12",
+     "La rete chiede lo storico celle/tempi dell'UE (mobilityHistoryReportReq-r12)"),
+    ("mobility_history_report", "lte-rrc.mobilityHistoryReport_r12",
+     "L'UE invia lo storico celle/tempi (mobilityHistoryReport-r12)"),
+    ("log_meas_available", "lte-rrc.logMeasAvailable_r10 or lte-rrc.logMeasAvailable_r13",
+     "L'UE dichiara misure MDT registrate da consegnare (logMeasAvailable)"),
+    ("location_in_measconfig", "lte-rrc.includeLocationInfo_r10 or lte-rrc.includeLocationInfo_r11",
+     "Una reportConfig chiede di includere la posizione nei report (includeLocationInfo)"),
+]
+
+LPP_SPECS = [
+    ("location_request", "lpp.requestLocationInformation_element",
+     "La rete chiede la posizione all'UE via LPP (RequestLocationInformation)"),
+    ("location_provide", "lpp.provideLocationInformation_element",
+     "L'UE invia la propria posizione via LPP (ProvideLocationInformation)"),
+    ("capability_request", "lpp.requestCapabilities_element",
+     "La rete chiede le capability di posizionamento LPP dell'UE"),
+    ("container", "nas-eps.emm.gen_msg_cont_type == 1",
+     "Contenitore LPP in un Generic NAS Transport"),
+]
+
+# ReportConfigEUTRA (TS 36.331): indici degli ENUMERATED come li riporta
+# tshark nei campi.
+REPORT_INTERVAL_MS = [120, 240, 480, 640, 1024, 2048, 5120, 10240,
+                      60000, 360000, 720000, 1800000, 3600000]
+REPORT_AMOUNT = ["1", "2", "4", "8", "16", "32", "64", "infinity"]
+PURPOSE = {"0": "reportStrongestCells", "1": "reportCGI"}
+
+
+def detect_by_specs(pcap, rules, cat, specs):
+    occs = []
+    for evt, disp_filter, default_detail in specs:
+        rule = rules.get((cat, evt))
+        if rule is None:
+            continue
+        occs += simple_tshark_detector(
+            pcap, rule, cat, evt, disp_filter,
+            detail_fn=lambda r, rule=rule, d=default_detail: (rule["comment"] or d))
+    return occs
+
+
+def frame_count(pcap, disp_filter):
+    return len(run_tshark_fields(pcap, disp_filter, ["frame.number"]))
+
+
+def write_verbose(pcap, disp_filter, path, title):
+    """Dettaglio tshark -V dei frame che corrispondono al filtro, solo se
+    ce n'e' almeno uno (nessun file vuoto nell'evidenza)."""
+    try:
+        out = subprocess.run(["tshark", "-r", pcap, "-Y", disp_filter, "-V"],
+                             capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if out.returncode != 0 or not out.stdout.strip():
+        return False
+    with open(path, "w") as f:
+        f.write(f"# {title} (tshark -Y '{disp_filter}' -V)\n\n")
+        f.write(out.stdout)
+    return True
+
+
+def tshark_json(pcap, disp_filter):
+    cmd = ["tshark", "-r", pcap, "-Y", disp_filter, "-T", "json", "--no-duplicate-keys"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        return json.loads(out.stdout) if out.returncode == 0 and out.stdout.strip() else []
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return []
+
+
+def _walk(node, key):
+    """Tutti i valori della chiave "key" a qualunque profondita' (le chiavi
+    ripetute sono liste con --no-duplicate-keys)."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == key:
+                for item in (v if isinstance(v, list) else [v]):
+                    yield item
+            yield from _walk(v, key)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _walk(item, key)
+
+
+def _first(node, key):
+    for v in _walk(node, key):
+        if isinstance(v, (str, int)):
+            return str(v)
+    return ""
+
+
+def _has(node, key):
+    return any(True for _ in _walk(node, key))
+
+
+def extract_report_configs(pcap):
+    rows = []
+    for pkt in tshark_json(pcap, "lte-rrc.reportConfigEUTRA_element"):
+        layers = pkt.get("_source", {}).get("layers", {})
+        frame = layers.get("frame", {})
+        ts, _approx = resolve_ts(pcap, frame.get("frame.time_epoch"))
+        for rc in _walk(layers, "lte-rrc.reportConfigEUTRA_element"):
+            periodic = _has(rc, "lte-rrc.periodical_element") or _first(rc, "lte-rrc.triggerType") == "1"
+            interval_idx = _first(rc, "lte-rrc.reportInterval")
+            amount_idx = _first(rc, "lte-rrc.reportAmount")
+            try:
+                interval_ms = REPORT_INTERVAL_MS[int(interval_idx)]
+            except (ValueError, IndexError):
+                interval_ms = None
+            try:
+                amount = REPORT_AMOUNT[int(amount_idx)]
+            except (ValueError, IndexError):
+                amount = ""
+            max_cells = _first(rc, "lte-rrc.maxReportCells")
+            rows.append({
+                "ts": ts,
+                "frame": frame.get("frame.number", ""),
+                "trigger": "periodical" if periodic else "event",
+                "purpose": PURPOSE.get(_first(rc, "lte-rrc.purpose"), "") if periodic else "",
+                "interval_ms": interval_ms,
+                "amount": amount,
+                "max_cells": int(max_cells) if max_cells.isdigit() else None,
+                "include_location": _has(rc, "lte-rrc.includeLocationInfo_r10")
+                                    or _has(rc, "lte-rrc.includeLocationInfo_r11"),
+            })
+    return rows
+
+
+def _param(rule, name, default):
+    try:
+        return int(rule["params"].get(name, default))
+    except (KeyError, ValueError, TypeError):
+        return default
+
+
+def detect_meas_config(pcap, rules, out_dir, mobility):
+    """MeasCfg: registra ogni reportConfig in meas_config.csv e segnala, a
+    terminale FERMO, il reporting periodico fitto e un numero elevato di
+    measurement report. Indicatore, non prova: a dispositivo fermo la
+    mobilita' non giustifica un reporting periodico ravvicinato su molte
+    celle, ma la rete puo' usarlo anche per ottimizzazione/SON."""
+    occs = []
+    configs = extract_report_configs(pcap)
+    if configs:
+        with open(os.path.join(out_dir, "meas_config.csv"), "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["utc_time", "frame", "trigger", "purpose", "report_interval_ms",
+                        "report_amount", "max_report_cells", "include_location_info", "mobilita"])
+            for c in configs:
+                w.writerow([iso(c["ts"]), c["frame"], c["trigger"], c["purpose"],
+                            c["interval_ms"] if c["interval_ms"] is not None else "",
+                            c["amount"], c["max_cells"] if c["max_cells"] is not None else "",
+                            int(c["include_location"]), mobility])
+
+    rule = rules.get(("MeasCfg", "periodic_report_config"))
+    if rule:
+        for c in configs:
+            if c["trigger"] == "periodical":
+                occs.append(mk_occ("MeasCfg", "periodic_report_config", c["ts"], rule["level"],
+                                   f"reportConfig periodica ({c['purpose'] or '?'}, "
+                                   f"ogni {c['interval_ms']} ms, x{c['amount'] or '?'}, "
+                                   f"max {c['max_cells']} celle)",
+                                   pcap, c["frame"]))
+
+    if mobility != "ferma":
+        return occs
+
+    rule = rules.get(("MeasCfg", "dense_periodic_stationary"))
+    if rule:
+        max_interval = _param(rule, "max_interval_ms", 2048)
+        min_amount = _param(rule, "min_report_amount", 16)
+        min_cells = _param(rule, "min_report_cells", 3)
+        for c in configs:
+            if c["trigger"] != "periodical" or c["interval_ms"] is None:
+                continue
+            amount_ok = c["amount"] == "infinity" or (c["amount"].isdigit() and int(c["amount"]) >= min_amount)
+            if (c["interval_ms"] <= max_interval and amount_ok
+                    and (c["max_cells"] or 0) >= min_cells):
+                occs.append(mk_occ(
+                    "MeasCfg", "dense_periodic_stationary", c["ts"], rule["level"],
+                    (rule["comment"] or "Reporting periodico fitto a terminale fermo")
+                    + f" (ogni {c['interval_ms']} ms, x{c['amount']}, {c['max_cells']} celle,"
+                      f" {c['purpose'] or 'purpose ?'})",
+                    pcap, c["frame"]))
+
+    rule = rules.get(("MeasCfg", "report_rate_stationary"))
+    if rule:
+        max_per_min = _param(rule, "max_reports_per_min", 6)
+        reports = run_tshark_fields(pcap, "lte-rrc.measurementReport_element",
+                                    ["frame.number", "frame.time_epoch"])
+        times = sorted(t for t, approx in (resolve_ts(pcap, r["frame.time_epoch"]) for r in reports)
+                       if not approx)
+        # una occorrenza per ogni minuto (finestre fisse) oltre la soglia
+        buckets = defaultdict(int)
+        for t in times:
+            buckets[int(t // 60)] += 1
+        for minute, n in sorted(buckets.items()):
+            if n > max_per_min:
+                occs.append(mk_occ("MeasCfg", "report_rate_stationary", minute * 60, rule["level"],
+                                   (rule["comment"] or "Measurement report frequenti a terminale fermo")
+                                   + f" ({n} in un minuto, soglia {max_per_min})"))
+    return occs
+
+
+def ue_capability_summary(pcap):
+    """Impronta e capability rilevanti dalla UECapabilityInformation (None
+    se l'UE non l'ha inviata durante la cattura)."""
+    rows = run_tshark_fields(pcap, "lte-rrc.ueCapabilityInformation_element",
+                             ["frame.number", "frame.time_epoch"])
+    if not rows:
+        return None
+    cmd = ["tshark", "-r", pcap, "-Y", "lte-rrc.ueCapabilityInformation_element", "-T", "fields",
+           "-E", "occurrence=a", "-E", "aggregator=;", "-e", "lte-rrc.ueCapabilityRAT_Container",
+           "-e", "lte-rrc.accessStratumRelease"]
+    containers, releases = set(), set()
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        for line in out.stdout.splitlines():
+            parts = line.split("\t") + [""]
+            containers.update(x.replace(":", "").lower() for x in parts[0].split(";") if x)
+            releases.update(x for x in parts[1].split(";") if x)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    fingerprint = hashlib.sha256("|".join(sorted(containers)).encode()).hexdigest() if containers else ""
+    flags = {
+        "loggedMeasurementsIdle": frame_count(
+            pcap, "lte-rrc.ueCapabilityInformation_element and lte-rrc.loggedMeasurementsIdle_r10") > 0,
+        "standaloneGNSS": frame_count(
+            pcap, "lte-rrc.ueCapabilityInformation_element and lte-rrc.standaloneGNSS_Location_r10") > 0,
+        "ueBasedNetwPerfMeas": frame_count(
+            pcap, "lte-rrc.ueCapabilityInformation_element and lte-rrc.ue_BasedNetwPerfMeasParameters_r10_element") > 0,
+    }
+    ts, _ = resolve_ts(pcap, rows[0]["frame.time_epoch"])
+    return {"fingerprint": fingerprint, "flags": flags, "releases": sorted(releases),
+            "frame": rows[0]["frame.number"], "ts": ts, "count": len(rows)}
+
+
+def detect_ue_capability(pcap, rules, args):
+    occs = []
+    cap = ue_capability_summary(pcap)
+    if cap is None:
+        rule = rules.get(("UECap", "no_capability"))
+        if rule:
+            lo, _ = capture_time_bounds(pcap)
+            occs.append(mk_occ("UECap", "no_capability", lo or 0, rule["level"],
+                               rule["comment"] or "Nessuna UECapabilityInformation inviata durante la cattura"))
+        return occs
+
+    path = os.path.join(args.out, "ue_capability.txt")
+    write_verbose(pcap, "lte-rrc.ueCapabilityInformation_element", path, "UECapabilityInformation inviate dall'UE")
+    with open(path, "a") as f:
+        f.write("\n# Riepilogo\n")
+        f.write(f"fingerprint={cap['fingerprint']}\n")
+        f.write(f"accessStratumRelease={','.join(cap['releases'])}\n")
+        for k, v in cap["flags"].items():
+            f.write(f"{k}={int(v)}\n")
+
+    rule = rules.get(("UECap", "mdt_capable"))
+    if rule and cap["flags"]["loggedMeasurementsIdle"]:
+        occs.append(mk_occ("UECap", "mdt_capable", cap["ts"], rule["level"],
+                           rule["comment"] or "L'UE dichiara il supporto al Logged MDT (loggedMeasurementsIdle-r10)",
+                           pcap, cap["frame"]))
+
+    if not args.imei or not cap["fingerprint"]:
+        return occs
+    base_dir = args.uecap_dir
+    base_file = os.path.join(base_dir, f"{args.imei}.txt")
+    previous = ""
+    try:
+        with open(base_file) as f:
+            for line in f:
+                if line.startswith("fingerprint="):
+                    previous = line.strip().split("=", 1)[1]
+    except OSError:
+        pass
+    rule = rules.get(("UECap", "capability_changed"))
+    if rule and previous and previous != cap["fingerprint"]:
+        occs.append(mk_occ("UECap", "capability_changed", cap["ts"], rule["level"],
+                           (rule["comment"] or "UECapabilityInformation diversa dalla sessione precedente")
+                           + f" (prima {previous[:12]}…, ora {cap['fingerprint'][:12]}…)",
+                           pcap, cap["frame"]))
+    if args.uecap_update:
+        try:
+            os.makedirs(base_dir, exist_ok=True)
+            with open(base_file, "w") as f:
+                f.write(f"fingerprint={cap['fingerprint']}\n")
+                f.write(f"updated={iso(datetime.now(timezone.utc))}\n")
+                for k, v in cap["flags"].items():
+                    f.write(f"{k}={int(v)}\n")
+        except OSError:
+            pass
+    return occs
+
+
+def print_failsoft(set_name):
+    sset = SCAN_SETS[set_name]
+    for cat, _ in sset["categories"]:
+        print(f"{cat}_L=I")
+        print(f"{cat}_N=0")
+    print(f"{sset['level_key']}=I")
+
+
+def cmd_full_scan(args):
+    now = datetime.now(timezone.utc)
+    sset = SCAN_SETS["full"]
+    keys = [k for k, _ in sset["categories"]]
+    warnings = []
+    if not args.out:
+        print("extra_scan: --out obbligatorio (fuori da --get-defs)", file=sys.stderr)
+        print_failsoft("full")
+        return 1
+    if not args.file:
+        warnings.append("--file non indicato: nessuna scansione .dlf/pcap possibile.")
+    os.makedirs(args.out, exist_ok=True)
+
+    cp, loaded_configs = load_config(args.configs_dir, args.op, args.profile, args.mcc, args.mnc,
+                                     main_name=sset["main_conf"])
+    # op/profile possono contenere anche regole delle categorie --extended:
+    # qui contano solo quelle del gruppo "full".
+    rules = {k: v for k, v in build_rules(cp).items() if k[0] in keys}
+
+    pcap, pcap_err = ensure_pcap(args.file, args.out) if args.file else (None, None)
+    if pcap_err:
+        warnings.append(pcap_err)
+
+    mobility, mobility_detail, _ = mdt_mobility.classify(
+        os.path.join(args.out, "periodic_cell_gps_decoded.csv"))
+    warnings.append(f"mobilita' del dispositivo: {mobility} ({mobility_detail})")
+
+    occurrences = []
+    if pcap:
+        occurrences += detect_by_specs(pcap, rules, "MDTExt", MDTEXT_SPECS)
+        occurrences += detect_by_specs(pcap, rules, "LPP", LPP_SPECS)
+        write_verbose(pcap, "lpp", os.path.join(args.out, "lpp_sessions.txt"),
+                      "Messaggi LPP (posizionamento) dentro il NAS")
+        occurrences += detect_meas_config(pcap, rules, args.out, mobility)
+        occurrences += detect_ue_capability(pcap, rules, args)
+    else:
+        warnings.append("nessun pcap disponibile: rilevatori del gruppo full saltati.")
+
+    occ_by_rule = defaultdict(list)
+    for o in occurrences:
+        occ_by_rule[(o.cat, o.evt)].append(o.ts)
+    cat_level, cat_count, rule_results, full_level = aggregate(rules, occ_by_rule, keys)
+
+    write_logs(args.out, occurrences, rule_results, now, keys=keys, prefix=sset["prefix"])
+    write_report(args.out, rules, warnings, loaded_configs, cat_level, cat_count, rule_results,
+                 full_level, now, categories=sset["categories"], prefix=sset["prefix"],
+                 level_key=sset["level_key"])
+
+    for cat in keys:
+        print(f"{cat}_L={cat_level[cat]}")
+        print(f"{cat}_N={cat_count[cat]}")
+    print(f"{sset['level_key']}={full_level}")
+    return 0
 
 
 # ---------------------------------------------------------------------
@@ -1038,6 +1460,17 @@ def parse_args(argv):
     ap.add_argument("--out", default="", help="directory di output (report/log)")
     ap.add_argument("--configs-dir", default=DEFAULT_CONFIGS_DIR,
                      help=f"directory extra_configs/ da usare (default: {DEFAULT_CONFIGS_DIR})")
+    ap.add_argument("--set", choices=sorted(SCAN_SETS), default="extended",
+                     help="gruppo di categorie: extended (mdtcap --extended, default) o "
+                          "full (mdtcap --full-scan)")
+    ap.add_argument("--imei", default="",
+                     help="solo --set full: IMEI del modulo, per il confronto della "
+                          "UECapabilityInformation con la sessione precedente")
+    ap.add_argument("--uecap-dir", default=os.path.join(PROJECT_DIR, "log", "ue_capability"),
+                     help="solo --set full: cartella delle impronte UECapability per IMEI")
+    ap.add_argument("--uecap-update", action="store_true",
+                     help="solo --set full: aggiorna l'impronta salvata per questo IMEI "
+                          "(mdtcap lo passa solo nelle catture live, mai in replay)")
     ap.add_argument("--test-sms", action="store_true",
                      help="cerca un SMS di test magico (vedi detect_test_sms_trigger) e forza "
                           "la categoria indicata al livello A - SOLO per verifica end-to-end "
@@ -1138,17 +1571,19 @@ def cmd_scan(args):
 
 def main():
     argv = sys.argv[1:]
+    set_name = "extended"
+    if "--set" in argv and argv.index("--set") + 1 < len(argv):
+        set_name = argv[argv.index("--set") + 1]
+    if set_name not in SCAN_SETS:
+        set_name = "extended"
     if "--get-defs" in argv:
-        return cmd_get_defs()
+        return cmd_get_defs(SCAN_SETS[set_name]["categories"])
     args = parse_args(argv)
     try:
-        return cmd_scan(args)
+        return cmd_full_scan(args) if args.set == "full" else cmd_scan(args)
     except Exception as exc:  # fail-soft: mai un traceback su stdout/verso mdtcap
         print(f"extra_scan: errore interno non gestito: {exc}", file=sys.stderr)
-        for cat in CATEGORY_KEYS:
-            print(f"{cat}_L=I")
-            print(f"{cat}_N=0")
-        print("extraLevel=I")
+        print_failsoft(args.set)
         return 0
 
 

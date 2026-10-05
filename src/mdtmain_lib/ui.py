@@ -13,7 +13,7 @@ import tty
 
 import dialog
 
-from . import alarmstate, constants, netinfo
+from . import alarmstate, constants, netinfo, stopctl
 
 # ESCDELAY basso (alcune distro lo riducono per un ESC piu' reattivo in
 # editor come vim) fa scambiare a ncurses una sequenza freccia/funzione
@@ -32,6 +32,29 @@ _d.set_background_title(f"MDTCap {constants.VERSION}")
 
 CLEAR_SCREEN = "\x1b[2J\x1b[H"
 
+# Testo dell'ultimo --infobox disegnato, o None se da allora lo schermo e'
+# stato sovrascritto da qualcos'altro. Serve SOLO a screen_infobox(
+# dedupe=True), usata dalla schermata di pausa del test continuato: quella
+# si ridisegna ogni POLL_INTERVAL_SECONDS (3s) per tenere il poll della
+# tastiera reattivo, ma il testo ("In pausa fino alle HH:MM") cambia
+# raramente — rilanciare il binario dialog(1) ogni 3 secondi per giorni di
+# fila (--edge-mode e' un servizio 24/7) lo farebbe solo lampeggiare.
+# Ogni altra schermata di questo modulo azzera il valore, quindi il
+# riquadro di pausa viene comunque ridisegnato appena qualcosa lo copre
+# (es. l'infobox di upload fra due finestre); per le schermate in ANSI
+# grezzo, che non passano da qui, ci pensa il chiamante (vedi
+# scheduler.run_one_capture).
+_last_infobox_text = None
+
+
+def invalidate_screen():
+    """Da chiamare quando lo schermo e' stato sovrascritto da qualcosa che
+    non passa dalle funzioni di questo modulo (le schermate in ANSI
+    grezzo di runner.py): il prossimo screen_infobox(dedupe=True) ridisegna
+    invece di considerarsi gia' a schermo."""
+    global _last_infobox_text
+    _last_infobox_text = None
+
 
 def clear_screen():
     """'dialog' disegna sullo schermo normale (nessun alternate screen
@@ -41,6 +64,7 @@ def clear_screen():
     dal ciclo interattivo (vedi mdtmain), MAI nella modalita' di debug
     "--run-local" (cancellerebbe l'output che quella modalita' serve a
     mostrare)."""
+    invalidate_screen()
     sys.stdout.write(CLEAR_SCREEN)
     sys.stdout.flush()
 
@@ -147,13 +171,17 @@ def screen_menu(title, text, choices, height=0, width=0, menu_height=0):
     un riquadro --infobox separato in basso a sinistra, rimosso — vedi
     current_net_status_text/header_text, ora e' nella scritta in alto a
     destra insieme a hostname/IP)."""
-    code, tag = _d.menu(text, choices=choices, height=height, width=width,
-                         menu_height=menu_height, **_title_kwargs(title))
+    invalidate_screen()
+    with stopctl.interruptible():
+        code, tag = _d.menu(text, choices=choices, height=height, width=width,
+                             menu_height=menu_height, **_title_kwargs(title))
     return tag if code == _d.OK else None
 
 
 def screen_yesno(text, title=None):
-    code = _d.yesno(text, **_title_kwargs(title))
+    invalidate_screen()
+    with stopctl.interruptible():
+        code = _d.yesno(text, **_title_kwargs(title))
     return code == _d.OK
 
 
@@ -162,17 +190,23 @@ def screen_okcancel(text, title=None):
     invece di quelle localizzate di default di dialog(1) — usata dove il
     testo stesso della domanda non e' un si'/no (es. "continuare
     comunque, o chiudere il programma?")."""
-    code = _d.yesno(text, yes_label="Ok", no_label="Cancel", **_title_kwargs(title))
+    invalidate_screen()
+    with stopctl.interruptible():
+        code = _d.yesno(text, yes_label="Ok", no_label="Cancel", **_title_kwargs(title))
     return code == _d.OK
 
 
 def screen_inputbox(text, init="", title=None, width=70):
-    code, value = _d.inputbox(text, init=init, width=width, **_title_kwargs(title))
+    invalidate_screen()
+    with stopctl.interruptible():
+        code, value = _d.inputbox(text, init=init, width=width, **_title_kwargs(title))
     return value if code == _d.OK else None
 
 
 def screen_passwordbox(text, init="", title=None, width=70):
-    code, value = _d.passwordbox(text, init=init, width=width, insecure=True, **_title_kwargs(title))
+    invalidate_screen()
+    with stopctl.interruptible():
+        code, value = _d.passwordbox(text, init=init, width=width, insecure=True, **_title_kwargs(title))
     return value if code == _d.OK else None
 
 
@@ -192,26 +226,38 @@ def screen_msgbox(text, title=None):
     ricevere tutta la larghezza disponibile quando gli serve davvero
     (nessuna riga del testo puo' essere piu' larga del terminale stesso,
     quindi min()/max() qui sotto arrivano comunque al caso precedente)."""
+    invalidate_screen()
     term_size = shutil.get_terminal_size(fallback=(80, 24))
     lines = text.split("\n")
     content_lines = len(lines)
     content_width = max((len(line) for line in lines), default=0)
     height = min(content_lines + 4, max(1, term_size.lines - 2))
     width = min(max(content_width + 4, 30), max(1, term_size.columns - 4))
-    _d.msgbox(text, height=height, width=width, **_title_kwargs(title))
+    with stopctl.interruptible():
+        _d.msgbox(text, height=height, width=width, **_title_kwargs(title))
 
 
-def screen_infobox(text, title=None):
+def screen_infobox(text, title=None, dedupe=False):
+    """dedupe=True: no-op se lo stesso testo e' gia' l'ultima cosa
+    disegnata a schermo (vedi _last_infobox_text) — per i chiamanti che
+    ridisegnano in un loop di poll, non per un avviso una tantum."""
+    global _last_infobox_text
+    stopctl.check()
+    if dedupe and text == _last_infobox_text:
+        return
     _d.infobox(text, width=70, **_title_kwargs(title))
+    _last_infobox_text = text
 
 
 def screen_checklist(title, text, items, height=0, width=0, list_height=0):
     """items: lista di (tag, descrizione, selezionato_bool). Ritorna
     l'insieme dei tag lasciati selezionati, o None se l'utente ha
     annullato/premuto ESC."""
+    invalidate_screen()
     choices = [(tag, desc, bool(checked)) for tag, desc, checked in items]
-    code, tags = _d.checklist(text, choices=choices, height=height, width=width,
-                               list_height=list_height, **_title_kwargs(title))
+    with stopctl.interruptible():
+        code, tags = _d.checklist(text, choices=choices, height=height, width=width,
+                                   list_height=list_height, **_title_kwargs(title))
     return set(tags) if code == _d.OK else None
 
 
@@ -241,13 +287,19 @@ def screen_pause_countdown(until_time):
         # ritorna subito (non attende input, vedi screen_infobox), quindi
         # il poll tastiera sotto — che decide davvero se fermarsi — resta
         # invariato e a carico nostro, non del widget.
+        # dedupe=True: questa funzione e' richiamata in loop ogni
+        # POLL_INTERVAL_SECONDS (serve a tenere reattivo il poll della
+        # tastiera sotto), ma il riquadro resta a schermo da solo finche'
+        # non lo copre qualcos'altro — vedi _last_infobox_text.
         screen_infobox(
             f"In pausa fino alle {until_str}.\n"
-            "Premere un tasto per interrompere e tornare al menu principale.")
-        if not is_tty:
-            time.sleep(constants.POLL_INTERVAL_SECONDS)
-            return False
-        ready, _, _ = select.select([sys.stdin], [], [], constants.POLL_INTERVAL_SECONDS)
+            "Premere un tasto per interrompere e tornare al menu principale.",
+            dedupe=True)
+        with stopctl.interruptible():
+            if not is_tty:
+                time.sleep(constants.POLL_INTERVAL_SECONDS)
+                return False
+            ready, _, _ = select.select([sys.stdin], [], [], constants.POLL_INTERVAL_SECONDS)
         if ready:
             try:
                 os.read(sys.stdin.fileno(), 1)

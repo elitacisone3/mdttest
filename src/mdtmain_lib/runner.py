@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-from . import constants
+from . import constants, stopctl
 
 CLEAR_SCREEN = "\x1b[2J\x1b[H"
 
@@ -21,6 +21,13 @@ SHM_FIELDS = [
     "extra_SMSSTK_L", "extra_SMSSTK_N", "extra_NASId_L", "extra_NASId_N",
     "extra_RRCCiph_L", "extra_RRCCiph_N", "extra_cellSys_L", "extra_cellSys_N",
     "extra_GPSLoc_L", "extra_GPSLoc_N", "extra_WCDMA3G_L", "extra_WCDMA3G_N",
+    "diagError",
+    # mdtcap --full-scan (src/extra_scan --set full)
+    "fullLevel",
+    "full_MDTExt_L", "full_MDTExt_N", "full_LPP_L", "full_LPP_N",
+    "full_MeasCfg_L", "full_MeasCfg_N", "full_UECap_L", "full_UECap_N",
+    # esito della sessione (src/coverage_report.py, sempre presente)
+    "esito",
 ]
 
 
@@ -170,16 +177,20 @@ def run_foreground_with_keypress_stop(args, shm_dir, header_fn, extra_status_fn=
     start_mdtcap) invece dell'elenco a righe fisse — modalita' di debug
     (mdtmain --run-local).
 
-    quiet=True (--edge-mode, vedi app.run_edge_mode): non scrive NULLA a
-    schermo in questo loop (nessun terminale garantito) — il poll di
-    tastiera/limiti prosegue invariato, semplicemente senza ridisegnare
-    header/stato a ogni giro.
+    quiet=True (collaudo dello scheduler, vedi
+    app.run_continuous_headless): non scrive NULLA a schermo in questo
+    loop — il poll di tastiera/limiti prosegue invariato, semplicemente
+    senza ridisegnare header/stato a ogni giro, cosi' il log in chiaro su
+    stdout di quella modalita' non viene continuamente cancellato.
+    --edge-mode NON la usa: disegna le stesse schermate dell'uso
+    interattivo (vedi app.run_edge_mode).
 
     should_stop, se passata, e' richiamata a ogni giro (in aggiunta al
     poll di tastiera): se ritorna True la prima volta, chiede a mdtcap di
     fermarsi esattamente come un tasto premuto (stop_reason "signal"
-    invece di "user_keypress") — usata da --edge-mode per un arresto
-    pulito su SIGTERM (vedi edgemode.py), che aspetta comunque la
+    invece di "user_keypress"). Lo stesso vale, sempre, per un arresto
+    chiesto via SIGTERM (stopctl.should_stop, --edge-mode/--screen, vedi
+    mdtmain --stop): un arresto pulito, che aspetta comunque la
     normale fine di mdtcap (stesso ciclo "signal_stop poi attendi
     proc.poll()" gia' usato per max_seconds/max_bytes sotto), non un
     kill immediato.
@@ -213,6 +224,24 @@ def run_foreground_with_keypress_stop(args, shm_dir, header_fn, extra_status_fn=
     start_time = time.monotonic()
     stop_reason = None
 
+    # Un SIGTERM durante la cattura chiede a mdtcap di fermarsi su QUESTA
+    # shm (vedi stopctl.py); il loop sotto se ne accorge via
+    # stopctl.should_stop() e attende la normale fine di mdtcap.
+    stopctl.set_active_capture(lambda: signal_stop(shm_dir))
+    try:
+        stop_reason = _poll_until_exit(proc, shm_dir, header_fn, extra_status_fn, max_seconds,
+                                       max_bytes, outdir, passthrough_tui, quiet, should_stop,
+                                       on_tick, start_time)
+    finally:
+        stopctl.clear_active_capture()
+
+    manifest = read_manifest(outdir) if outdir else None
+    return stop_reason or "finished", manifest
+
+
+def _poll_until_exit(proc, shm_dir, header_fn, extra_status_fn, max_seconds, max_bytes, outdir,
+                     passthrough_tui, quiet, should_stop, on_tick, start_time):
+    stop_reason = None
     with _RawKeyPoll() as keys:
         while True:
             if not quiet and not passthrough_tui:
@@ -231,7 +260,8 @@ def run_foreground_with_keypress_stop(args, shm_dir, header_fn, extra_status_fn=
                 if stop_reason is None:
                     stop_reason = "user_keypress"
                     signal_stop(shm_dir)
-            elif should_stop is not None and stop_reason is None and should_stop():
+            elif stop_reason is None and (stopctl.should_stop()
+                                          or (should_stop is not None and should_stop())):
                 stop_reason = "signal"
                 signal_stop(shm_dir)
             elif max_seconds is not None and stop_reason is None and (time.monotonic() - start_time) > max_seconds:
@@ -244,6 +274,4 @@ def run_foreground_with_keypress_stop(args, shm_dir, header_fn, extra_status_fn=
 
             if proc.poll() is not None:
                 break
-
-    manifest = read_manifest(outdir) if outdir else None
-    return stop_reason or "finished", manifest
+    return stop_reason

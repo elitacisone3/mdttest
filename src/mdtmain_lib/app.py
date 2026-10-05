@@ -13,9 +13,9 @@ import time
 import tty
 from datetime import datetime
 
-from . import (constants, contract, edgemode, evidence, gpgtrust, httpclient, masterlog,
+from . import (constants, contract, evidence, gpgtrust, httpclient, masterlog,
                mdtmain_config, netconfig, netinfo, profiles, runner, screenmode, scheduler,
-               sound, syslog_log, ui, usbmount)
+               sound, stopctl, syslog_log, ui, usbmount)
 
 
 _STARTUP_DISCLAIM_TEXT = """Attenzione:
@@ -303,6 +303,9 @@ def screen_settings():
         ("gpsfix", "Forza il fix GPS prima dei test", mdtmain_config.get_bool(config, "doGPSFix")),
         ("extended", "Imposta i test approfonditi", mdtmain_config.get_bool(config, "forceExtended")),
         ("testsms", "Modalità test SMS", mdtmain_config.get_bool(config, "testSMS")),
+        ("fullscan", "Imposta la scansione completa", mdtmain_config.get_bool(config, "fullScan")),
+        ("fulldiag", "Log DIAG completo (più lento, solo diagnostica)", mdtmain_config.get_bool(config, "fullDiagLog")),
+        ("selftest", "Self-test dei log all'avvio della cattura", mdtmain_config.get_bool(config, "selfTest")),
         ("checkpoint", "Abilita la sirena nei checkpoint", mdtmain_config.get_bool(config, "alarmCheckPoint")),
         ("disablesend", "Disabilita l'invio delle evidenze", mdtmain_config.get_bool(config, "disableSend")),
     ]
@@ -323,6 +326,9 @@ def screen_settings():
         doGPSFix="1" if "gpsfix" in selected else "0",
         forceExtended="1" if "extended" in selected else "0",
         testSMS="1" if "testsms" in selected else "0",
+        fullScan="1" if "fullscan" in selected else "0",
+        fullDiagLog="1" if "fulldiag" in selected else "0",
+        selfTest="1" if "selftest" in selected else "0",
         alarmCheckPoint="1" if "checkpoint" in selected else "0",
         disableSend=disable_send,
     )
@@ -362,9 +368,12 @@ def _ensure_gps_fix_if_needed(quiet=False):
     test (mdtcap resta il gate vero e proprio se il profilo lo
     richiede). No-op se doGPSFix=0 (default).
 
-    quiet=True (--edge-mode): nessuna schermata (nessun terminale
-    garantito), gli stessi avvisi vanno solo su syslog (vedi
-    syslog_log.py)."""
+    quiet=True: nessuna schermata (nessun terminale garantito), gli
+    avvisi restano solo su syslog. I syslog_log.* NON sono condizionati a
+    quiet: --edge-mode disegna sullo schermo (quiet=False li') ma deve
+    comunque lasciare traccia su journalctl, e nell'uso interattivo
+    normale syslog_log e' un no-op (vedi syslog_log.py), quindi non
+    cambia nulla."""
     if not mdtmain_config.get_bool(mdtmain_config.load(), "doGPSFix"):
         return
     if not quiet:
@@ -375,15 +384,13 @@ def _ensure_gps_fix_if_needed(quiet=False):
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
-        if quiet:
-            syslog_log.error(f"mdtmain: impossibile eseguire mdtgps: {e}")
-        else:
+        syslog_log.error(f"mdtmain: impossibile eseguire mdtgps: {e}")
+        if not quiet:
             ui.screen_msgbox(f"Impossibile eseguire mdtgps: {e}")
         return
     if proc.returncode == 2:
-        if quiet:
-            syslog_log.warning("mdtmain: nessun fix GPS ottenuto entro il timeout, il test prosegue comunque.")
-        else:
+        syslog_log.warning("mdtmain: nessun fix GPS ottenuto entro il timeout, il test prosegue comunque.")
+        if not quiet:
             ui.screen_msgbox("Nessun fix GPS ottenuto entro il timeout: il test prosegue comunque.")
 
 
@@ -512,8 +519,7 @@ def screen_local_test():
         args += ["--sim-pin", sim_pin]
     if duration_seconds:
         args += ["--duration", duration_seconds]
-    mdtmain_config.apply_forced_extended(args)
-    mdtmain_config.apply_test_sms(args)
+    mdtmain_config.apply_capture_options(args)
     args.append("--no-beep")
     stop_reason, manifest, report_text = _run_local_test_core(args)
     ui.screen_msgbox(_format_result(manifest, stop_reason, report_text))
@@ -574,8 +580,7 @@ def run_local_test_headless(profile=None, sim_pin=None, duration_minutes=None):
         args += ["--sim-pin", sim_pin]
     if duration_seconds:
         args += ["--duration", duration_seconds]
-    mdtmain_config.apply_forced_extended(args)
-    mdtmain_config.apply_test_sms(args)
+    mdtmain_config.apply_capture_options(args)
 
     stop_reason, manifest, report_text = _run_local_test_core(args, mdtcap_tui=False)
     print()
@@ -741,8 +746,7 @@ def screen_usb_test():
         args += ["--sim-pin", sim_pin]
     if duration_seconds:
         args += ["--duration", duration_seconds]
-    mdtmain_config.apply_forced_extended(args)
-    mdtmain_config.apply_test_sms(args)
+    mdtmain_config.apply_capture_options(args)
     args.append("--no-beep")
     outdir = os.path.join(constants.USB_MOUNTPOINT, constants.USB_EVIDENCE_SUBDIR, evidence.timestamp_now())
     _ensure_gps_fix_if_needed()
@@ -940,30 +944,75 @@ def screen_remove_continuous_test():
 
 # ---- modalita' --edge-mode (servizio non presidiato) -----------------------
 
+def _edge_mode_menu():
+    """Menu principale interattivo raggiunto da --edge-mode (schermo e
+    tastiera collegati: vedi run_edge_mode). Salta la configurazione di
+    rete (--edge-mode non e' pensato per quello) e non riprende il test
+    continuato da sola. Ritorna sempre EXIT_OK: uscendo dal menu mdtmain
+    termina, e sotto systemd con Restart=always il servizio riparte da
+    solo tornando in --edge-mode — cosi' un tecnico puo' prendersi il
+    modem per il tempo che gli serve e riaverlo al servizio senza fare
+    nulla."""
+    try:
+        run_app(skip_network_setup=True, force_network_setup=False, auto_start=False)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        ui.clear_screen()
+    return constants.EXIT_OK
+
+
+def _edge_mode_abort(message):
+    """Errore di avvio in --edge-mode: sempre su syslog (unico canale che
+    resta in un uso davvero non presidiato); se uno schermo HDMI risulta
+    collegato e attivo c'e' invece qualcuno che puo' leggerlo e
+    rimediare, quindi lo mostra anche a schermo e apre il menu principale
+    invece di fermarsi (stesso spirito dell'eccezione "test continuato
+    non configurato" in run_edge_mode). Senza schermo resta il
+    comportamento di sempre: EXIT_ERROR, il servizio esce e la decisione
+    su cosa fare e' di systemd. "message" e' una frase gia' leggibile da
+    sola, senza il prefisso "mdtmain: --edge-mode" (aggiunto qui per
+    syslog, fuori posto in una msgbox)."""
+    syslog_log.error(f"mdtmain: --edge-mode {message}")
+    if screenmode.hdmi_display_active():
+        ui.screen_msgbox(message)
+        return _edge_mode_menu()
+    return constants.EXIT_ERROR
+
+
 def run_edge_mode():
     """mdtmain --edge-mode: stesso test continuato di "Imposta test
     continuato" sopra, ma pensato per girare come servizio systemd (non
-    ancora installato, vedi mdtmain --help) SENZA nessuna schermata (non
-    c'e' nessun terminale/nessuna persona che possa rispondere a un
-    dialog) — richiede quindi che testSim/mdtcapProfile/schedulerProfile
-    siano gia' stati salvati da un uso interattivo precedente di "Imposta test
-    continuato" (autoStart=1, il default). A differenza di quella
-    schermata: nessuna conferma esplicita di invio dati (implicita nella
-    sola esistenza di una configurazione salvata), e nessuna richiesta di
-    token se il contratto non risulta registrato (nessuno schermo per
-    chiederlo: fallisce con un errore su syslog, da registrare a mano
-    prima di riprovare). Ogni evento significativo (avvio/fine
-    finestra, allarme, evidenza inviata, errore/blocco) va su syslog
-    (vedi syslog_log.py), MAI su schermo. Ritorna
-    constants.EXIT_OK/EXIT_ERROR.
+    ancora installato, vedi mdtmain --help) SENZA che nessuna
+    interazione sia mai NECESSARIA per proseguire — richiede quindi che
+    testSim/mdtcapProfile/schedulerProfile siano gia' stati salvati da un
+    uso interattivo precedente di "Imposta test continuato" (autoStart=1,
+    il default). A differenza di quella schermata: nessuna conferma
+    esplicita di invio dati (implicita nella sola esistenza di una
+    configurazione salvata), e nessuna richiesta di token se il contratto
+    non risulta registrato (fallisce con un errore, da registrare a mano
+    prima di riprovare).
+
+    Le schermate ci sono comunque, identiche a quelle di --screen
+    --auto-start (vedi _resume_continuous_test): il test in corso con i
+    pallini di stato, la pausa fra una finestra di schedulazione e la
+    successiva, il riepilogo finale — altrimenti lo schermo collegato al
+    dispositivo resterebbe nero per giorni, senza modo di sapere se il
+    servizio stia girando, sia in pausa o si sia fermato. Premendo un
+    tasto il test continuato si ferma (stop_reason "user_keypress", vedi
+    scheduler.run_continuous) e si apre il menu principale: un tasto
+    premuto significa che qualcuno e' davvero davanti allo schermo. Ogni
+    evento significativo (avvio/fine finestra, allarme, evidenza
+    inviata, errore/blocco) va COMUNQUE ANCHE su syslog (vedi
+    syslog_log.py), unico canale che resta quando nessuno guarda.
+    Ritorna constants.EXIT_OK/EXIT_ERROR.
 
     Eccezione: se il test continuato NON e' configurato ma uno schermo
     HDMI risulta collegato e attivo (screenmode.hdmi_display_active()),
     non ci si ferma con un errore — si assume che qualcuno l'abbia
     appena collegato per configurare/usare il device a mano, e si
-    propone il menu principale come in un avvio interattivo normale
-    (saltando solo la configurazione di rete: --edge-mode non e' pensato
-    per quello)."""
+    propone il menu principale come in un avvio interattivo normale. Lo
+    stesso vale per gli altri errori di avvio, vedi _edge_mode_abort."""
     config = mdtmain_config.load()
     if not (mdtmain_config.get_bool(config, "autoStart") and config["testSim"]
             and config["mdtcapProfile"] and config["schedulerProfile"]):
@@ -971,13 +1020,7 @@ def run_edge_mode():
             syslog_log.warning(
                 "mdtmain: --edge-mode senza test continuato configurato, ma uno schermo HDMI "
                 "risulta collegato e attivo: mostro il menu principale invece di fermarmi.")
-            try:
-                run_app(skip_network_setup=True, force_network_setup=False, auto_start=False)
-            except KeyboardInterrupt:
-                pass
-            finally:
-                ui.clear_screen()
-            return constants.EXIT_OK
+            return _edge_mode_menu()
         syslog_log.error(
             "mdtmain: --edge-mode richiede un test continuato gia' configurato "
             "(autoStart/testSim/mdtcapProfile/schedulerProfile): usare prima 'Imposta test "
@@ -987,43 +1030,37 @@ def run_edge_mode():
     try:
         iccid, contract_id = contract.get_sim_user()
     except contract.ContractError as e:
-        syslog_log.error(f"mdtmain: --edge-mode impossibile leggere la SIM ({e}). Arresto.")
-        return constants.EXIT_ERROR
+        return _edge_mode_abort(f"impossibile leggere la SIM ({e}). Arresto.")
     if iccid != config["testSim"]:
-        syslog_log.error(
-            "mdtmain: --edge-mode l'ICCID della SIM inserita non corrisponde a quello "
-            "configurato per il test continuato. Arresto.")
-        return constants.EXIT_ERROR
+        return _edge_mode_abort(
+            "l'ICCID della SIM inserita non corrisponde a quello configurato per il test "
+            "continuato. Arresto.")
 
     try:
         server = httpclient.load_server_conf()
         host = server["host"]
     except httpclient.ServerError as e:
-        syslog_log.error(f"mdtmain: --edge-mode configurazione server non valida ({e}). Arresto.")
-        return constants.EXIT_ERROR
+        return _edge_mode_abort(f"configurazione server non valida ({e}). Arresto.")
 
     registered, reachable = httpclient.verify_contract_with_cache(host, contract_id)
     if not reachable and not registered:
-        syslog_log.error(
-            "mdtmain: --edge-mode server non raggiungibile e nessuna verifica precedente "
-            "in cache. Arresto.")
-        return constants.EXIT_ERROR
+        return _edge_mode_abort(
+            "server non raggiungibile e nessuna verifica precedente in cache. Arresto.")
     if not reachable:
         syslog_log.warning(
             f"mdtmain: --edge-mode server non raggiungibile, riprendo usando la verifica "
             f"del contratto in cache ({contract_id}).")
     if not registered:
-        syslog_log.error(
-            "mdtmain: --edge-mode contratto non registrato sul server (serve un token, "
-            "non richiedibile senza schermo: registrarlo con un uso interattivo). Arresto.")
-        return constants.EXIT_ERROR
+        return _edge_mode_abort(
+            "contratto non registrato sul server (serve un token, non richiedibile senza "
+            "schermo: registrarlo con un uso interattivo). Arresto.")
 
-    _ensure_gps_fix_if_needed(quiet=True)
+    _ensure_gps_fix_if_needed()
 
-    # Nessuna UI in --edge-mode: un problema con le chiavi GPG non puo'
-    # aprire una msgbox (nessuno la vedrebbe) - viene solo loggato su
-    # syslog, e l'invio resta disabilitato per questa esecuzione del
-    # servizio (la cattura/schedulazione locale prosegue comunque, vedi
+    # Un problema con le chiavi GPG non ferma il servizio: viene loggato
+    # su syslog (e mostrato a schermo se c'e' davvero uno schermo che lo
+    # mostri) e l'invio resta disabilitato per questa esecuzione, mentre
+    # la cattura/schedulazione locale prosegue comunque (vedi
     # scheduler.run_continuous send_disabled).
     send_disabled = False
     try:
@@ -1032,20 +1069,34 @@ def run_edge_mode():
         syslog_log.warning(
             f"mdtmain: --edge-mode chiave GPG non valida ({e}): invio disabilitato per questa esecuzione.")
         send_disabled = True
+        if screenmode.hdmi_display_active():
+            ui.screen_msgbox(f"Attenzione: Problema con le chiavi GPG\n{e}\n\n"
+                              "L'invio dei dati resta disabilitato per questa esecuzione; "
+                              "il test continuato prosegue comunque.")
 
     syslog_log.info(
         f"mdtmain: --edge-mode avvio test continuato (profilo {config['mdtcapProfile']!r}, "
         f"schedulazione {config['schedulerProfile']!r}).")
+    ui.screen_infobox("Avvio del modulo in corso, attendere...")
     try:
         stop_reason, manifest = scheduler.run_continuous(
             config["schedulerProfile"], config["mdtcapProfile"], contract_id, host,
-            sim_pin=config["testPin"], quiet=True, should_stop=edgemode.should_stop,
+            sim_pin=config["testPin"], should_stop=stopctl.should_stop,
             send_disabled=send_disabled)
+    except profiles.ScheduleSyntaxError as e:
+        return _edge_mode_abort(f"schedulazione non valida: {e}. Arresto.")
     except Exception as e:  # non deve mai morire in silenzio sotto systemd
-        syslog_log.error(f"mdtmain: --edge-mode interrotto da un errore imprevisto: {e}")
-        return constants.EXIT_ERROR
+        return _edge_mode_abort(f"interrotto da un errore imprevisto: {e}")
 
     syslog_log.info(f"mdtmain: --edge-mode test continuato terminato ({stop_reason}).")
+    if stop_reason == "user_keypress":
+        # Solo per un tasto premuto: c'e' qualcuno davanti allo schermo
+        # che ha chiesto di fermare il test, quindi riepilogo finale e
+        # menu principale come in --auto-start (vedi
+        # _resume_continuous_test). MAI per "signal" (SIGTERM: arresto
+        # del servizio, nessuno da informare e nessun menu da aprire).
+        ui.screen_msgbox(_format_continuous_result(manifest, stop_reason))
+        return _edge_mode_menu()
     return constants.EXIT_OK
 
 
@@ -1078,8 +1129,7 @@ def screen_send_data_test():
         args += ["--sim-pin", sim_pin]
     if duration_seconds:
         args += ["--duration", duration_seconds]
-    mdtmain_config.apply_forced_extended(args)
-    mdtmain_config.apply_test_sms(args)
+    mdtmain_config.apply_capture_options(args)
     args.append("--no-beep")
 
     persistent_dir = evidence.pick_persistent_dir()

@@ -1,4 +1,4 @@
-# `extra_configs/` — regole per `src/extra_scan` (`mdtcap --extended`)
+# `extra_configs/` — regole per `src/extra_scan` (`mdtcap --extended` e `--full-scan`)
 
 Configurazione delle soglie/regole usate da `src/extra_scan` per la
 "discriminazione iniziale" di comportamenti di rete sospetti/malevoli
@@ -11,7 +11,8 @@ INDIPENDENTE: le due directory non si influenzano a vicenda.
 
 ```
 extra_configs/
-├── main.conf              # base per tutte le categorie/regole
+├── main.conf              # base per le categorie di --extended
+├── full_scan.conf         # base per le categorie di --full-scan (MDTExt/LPP/MeasCfg/UECap)
 ├── op/
 │   └── <nome>.conf         # override per operatore (facoltativo)
 ├── mcc-mnc/
@@ -19,6 +20,22 @@ extra_configs/
 └── profile/
     └── <nome>.conf         # override per profilo di test (facoltativo)
 ```
+
+## Due gruppi di regole
+
+`src/extra_scan` ha due gruppi di categorie indipendenti, con lo stesso
+formato e lo stesso motore:
+
+- `--set extended` (`mdtcap --extended`): categorie SMSSTK/NASId/
+  RRCCiph/cellSys/GPSLoc/WCDMA3G, file base `main.conf`;
+- `--set full` (`mdtcap --full-scan`): categorie MDTExt/LPP/MeasCfg/
+  UECap, file base `full_scan.conf` (vedi l'intestazione di quel file
+  per le chiavi specifiche di MeasCfg, es. `max_interval_ms`).
+
+`op/` e `profile/` sono condivisi: possono contenere sezioni di
+entrambi i gruppi, e ciascun gruppo considera solo le proprie categorie.
+Nell'ordine di lettura sotto, per `--full-scan` il primo file e'
+`full_scan.conf` al posto di `main.conf`.
 
 ## Ordine di lettura
 

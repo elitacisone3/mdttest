@@ -29,6 +29,12 @@ MDTMAIN_CONF_FILE = os.path.join(MAIN_CONFIGS_DIR, "mdtmain.conf")
 # svuotato ad ogni riavvio, cosi' un pid residuo di un boot precedente
 # non punta mai a un processo davvero vivo con lo stesso pid.
 EDGE_MODE_PID_FILE = "/run/mdtmain_edge.pid"
+# Stesso meccanismo per --screen: letto solo da mdtmain --stop (un nuovo
+# avvio di mdtmain chiude l'istanza --edge-mode, mai quella --screen).
+SCREEN_MODE_PID_FILE = "/run/mdtmain_screen.pid"
+# mdtmain --stop: tempo concesso a un'istanza per chiudere in modo pulito
+# un'eventuale cattura mdtcap in corso prima del SIGKILL.
+STOP_GRACE_SECONDS = 60
 
 # Suoni --screen (vedi screenmode.py/sound.py), gia' presenti in src/res/.
 BEEP_WAV = os.path.join(RES_DIR, "beep.wav")
